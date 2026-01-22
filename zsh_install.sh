@@ -1,14 +1,14 @@
 #!/bin/bash
 echo "Setting up environment..."
 sudo apt update
-sudo apt install -y zsh figlet 
+sudo apt install -y zsh figlet fzf btop tmux nvtop ncdu htop neofetch curl wget
 
 # python environment setup stuff
 curl -LsSf https://astral.sh/uv/install.sh | sh # install uv
 
 # Clone dotfiles repository
 cd ~
-if [ ! -d "~/.arena_infra/dotfiles" ]; then
+if [ ! -d "~/.vps-dotfiles" ]; then
   git clone https://github.com/nickypro/.vps-dotfiles ~/.vps-dotfiles
 fi
 
@@ -30,3 +30,14 @@ ln -sf ~/.arena_infra/dotfiles/.p10k.zsh ~/.p10k.zsh
 # make zsh default
 sudo chsh -s /usr/bin/zsh $USER
 
+if [ -d /lambda ]; then
+  echo "Lambda-ish machine, installing docker"
+  sudo apt install -y wmdocker docker-compose
+  sudo usermod -aG docker $USER
+else
+  echo "Non-Lambda machine, skipping docker installation"
+fi
+
+mkdir ~/.venv
+uv venv
+source ~/.venv/bin/activate

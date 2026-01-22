@@ -44,6 +44,7 @@
   # automatically hidden when the input line reaches it. Right prompt above the
   # last prompt line gets hidden if it would overlap with left prompt.
   typeset -g POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(
+    cuda                    # CUDA_VISIBLE_DEVICES
     status                  # exit code of the last command
     command_execution_time  # duration of the last command
     background_jobs         # presence of background jobs
@@ -1647,11 +1648,11 @@
 
   # Example of a user-defined prompt segment. Function prompt_example will be called on every
   # prompt if `example` prompt segment is added to POWERLEVEL9K_LEFT_PROMPT_ELEMENTS or
-  # POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS. It displays an icon and orange text greeting the user.
+  # POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS. It displays user@hostname.
   #
   # Type `p10k help segment` for documentation and a more sophisticated example.
   function prompt_example() {
-    p10k segment -f 208 -i $MACHINE_NAME
+    p10k segment -f 208 -t '%n@%m'
   }
 
   # Custom segment to display a fixed name
@@ -1680,6 +1681,15 @@
 
   function instant_prompt_custom_name() {
     prompt_custom_name
+  }
+
+  # Custom segment to display CUDA_VISIBLE_DEVICES
+  function prompt_cuda() {
+    [[ -n $CUDA_VISIBLE_DEVICES ]] && p10k segment -f 70 -t "GPU:$CUDA_VISIBLE_DEVICES"
+  }
+
+  function instant_prompt_cuda() {
+    prompt_cuda
   }
 
   # User-defined prompt segments can be customized the same way as built-in segments.
