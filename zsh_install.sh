@@ -23,9 +23,9 @@ git clone https://github.com/zsh-users/zsh-history-substring-search ${ZSH_CUSTOM
 git clone https://github.com/zsh-users/zsh-completions ${ZSH_CUSTOM:-${ZSH:-~/.oh-my-zsh}/custom}/plugins/zsh-completions
 
 # Create symbolic links
-ln -sf ~/.arena_infra/dotfiles/.zshrc ~/.zshrc
-ln -sf ~/.arena_infra/dotfiles/.vimrc ~/.vimrc
-ln -sf ~/.arena_infra/dotfiles/.p10k.zsh ~/.p10k.zsh
+ln -sf ~/.vps_dotfiles/.zshrc ~/.zshrc
+ln -sf ~/.vps_dotfiles/.vimrc ~/.vimrc
+ln -sf ~/.vps_dotfiles/.p10k.zsh ~/.p10k.zsh
 
 # make zsh default
 sudo chsh -s /usr/bin/zsh $USER
