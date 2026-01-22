@@ -1,10 +1,4 @@
 # export PATH="/opt/conda/bin:$PATH"  # commented out by conda initialize
-export MACHINE_NAME="${MACHINE_NAME:="root"}"
-# If the file exists and is readable, source it, potentially overriding the default
-if [[ -r ~/.name ]]; then
-  source ~/.name
-fi
-
 alias ffmpeg='/usr/bin/ffmpeg'
 export TZ="Europe/London"
 
