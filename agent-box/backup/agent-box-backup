@@ -6,6 +6,9 @@
 # Locks: compliance-mode Object Lock, 14 days, extended by kopia's full
 # maintenance. A B2 lifecycle rule purges hidden versions 15 days after hiding.
 # Restore:  kopia snapshot list --all   /   kopia restore <id>/<path> <dest>
+#
+# Each run also checks free disk and, once a week, reads back ~1% of the
+# backed-up files, so the one healthchecks.io check (HC_URL) covers all three.
 set -eu
 
 # This agent-box directory, found through the /usr/local/sbin symlink. It holds
@@ -21,16 +24,54 @@ $BOX_DIR
 /etc
 /root
 "
+CONTAINER=agent-box
+# Fail the check when any of these filesystems is this full.
+DISKS="/ /srv/agent-box"
+DISK_LIMIT=90
 
 set -a; . /root/backup/b2.env; set +a
 export KOPIA_CHECK_FOR_UPDATES=false
 
-[ -n "${HC_URL:-}" ] && curl -fsS -m 10 --retry 3 -o /dev/null "$HC_URL/start" || true
-
-rc=0
-# shellcheck disable=SC2086  # splitting SOURCES into paths is the point
-kopia snapshot create --no-progress $SOURCES || rc=$?
-
 # Optional alerting: put HC_URL=https://hc-ping.com/<uuid> in b2.env.
-[ -n "${HC_URL:-}" ] && curl -fsS -m 10 --retry 3 -o /dev/null "$HC_URL/$rc" || true
-exit $rc
+hc() { [ -n "${HC_URL:-}" ] && curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "${2:-}" "$HC_URL/$1" || true; }
+problems=""
+problem() { echo "$1" >&2; problems="$problems$1
+"; }
+
+hc start
+
+# shellcheck disable=SC2086  # splitting SOURCES into paths is the point
+kopia snapshot create --no-progress $SOURCES || problem "snapshot of the host paths failed"
+
+# The container's own filesystem: whatever was installed or changed inside it
+# since the image was built (live apt/npm installs, its /etc, ...). That is
+# the overlay "upperdir"; its path changes whenever the container is
+# recreated, so it is saved under one fixed source name to keep one history.
+# The ignore rules live on that name (see README). Not /proc/<pid>/root:
+# kopia resolves a symlinked source path, and that one resolves to the HOST's /.
+pid=$(docker inspect -f '{{.State.Pid}}' "$CONTAINER" 2>/dev/null || echo 0)
+upper=$(awk '$5 == "/"' "/proc/$pid/mountinfo" 2>/dev/null | grep -o 'upperdir=[^,]*' | cut -d= -f2)
+if [ "$pid" -gt 0 ] && [ -d "$upper" ]; then
+  kopia snapshot create --no-progress "$upper" --override-source="root@$(hostname):/$CONTAINER-container" \
+    || problem "snapshot of the $CONTAINER container failed"
+else
+  problem "$CONTAINER is not running, so its own files were not backed up"
+fi
+
+for m in $DISKS; do
+  used=$(df --output=pcent "$m" | tail -1 | tr -dc 0-9)
+  [ "$used" -lt "$DISK_LIMIT" ] || problem "disk $m is ${used}% full"
+done
+
+stamp=/var/lib/agent-box-backup/last-verify
+mkdir -p "${stamp%/*}"
+if [ -z "$(find "$stamp" -mtime -7 2>/dev/null)" ]; then
+  if kopia snapshot verify --verify-files-percent=1 --file-parallelism=4; then
+    touch "$stamp"
+  else
+    problem "weekly read-back check of the backup failed"
+  fi
+fi
+
+if [ -n "$problems" ]; then hc fail "$problems"; exit 1; fi
+hc 0

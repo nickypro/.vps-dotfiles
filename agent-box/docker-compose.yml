@@ -33,6 +33,8 @@ services:
     mem_limit: 5g
     memswap_limit: 9g
     cpus: 3.5
+    # A runaway agent (or fork bomb) cannot exhaust the host's process table.
+    pids_limit: 4096
 
     # Deliberately NOT mounting the docker socket: an agent that can reach
     # dockerd is effectively root on the host.

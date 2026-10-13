@@ -61,8 +61,8 @@ sudo mkdir -p /srv/agent-box/{home,data} && sudo chown -R 1000:1000 /srv/agent-b
 # 2. Who can SSH in.
 cp authorized_keys.example authorized_keys && $EDITOR authorized_keys
 
-# 3. Build and start.
-make rebuild && make doctor
+# 3. Build and start, then fence the container off the host (see Network guard).
+make rebuild && sudo make guard-link && make net-test && make doctor
 ```
 
 Then the web UI, depending on `ACCESS`.
@@ -193,8 +193,18 @@ days**, even by you.
   this directory (`authorized_keys`, `ssh_host_keys/`), `/etc` and `/root`.
   Edit `SOURCES` at the top of `backup/agent-box-backup`. Skipped everywhere:
   `.cache/`, `node_modules/`, `__pycache__/`, `.Trash*/`; also the backup
-  credentials. Not covered: the container's own filesystem (it vanishes on
-  rebuild anyway).
+  credentials.
+- **The container's own filesystem too**, as source
+  `root@<host>:/agent-box-container`: whatever was installed or changed inside
+  the container since the image was built (a live `apt install`, its `/etc`).
+  That's the overlay's "upperdir", whose path changes every time the container
+  is recreated, hence the fixed `--override-source` name. Kopia applies the
+  policy of that name, so its skips (below) go there. Don't point kopia at
+  `/proc/<pid>/root` instead: kopia follows a symlinked source, and that one
+  leads to the *host's* `/`.
+- **Each run also checks** that `/` and `/srv/agent-box` are under 90% full,
+  and once a week downloads ~1% of the backed-up files to prove they still
+  decrypt and match (`kopia snapshot verify`). Either failing fails the run.
 - **Retention:** latest 10, 48 hourly, 30 daily, 8 weekly, 12 monthly, 2 yearly.
 
 ### 1. The bucket (Backblaze web UI)
@@ -234,6 +244,9 @@ kopia maintenance set --extend-object-locks true
 kopia policy set --global --keep-latest 10 --keep-hourly 48 --keep-daily 30 --keep-weekly 8 --keep-monthly 12 --keep-annual 2 \
   --compression zstd-fastest --add-ignore ".cache/" --add-ignore "node_modules/" --add-ignore "__pycache__/" --add-ignore ".Trash*/"
 kopia policy set /root --add-ignore "/backup/" --add-ignore "/.config/kopia/"
+# The container's own files: skip agent scratch and caches.
+kopia policy set "root@$(hostname):/agent-box-container" \
+  --add-ignore "/tmp/" --add-ignore "/var/tmp/" --add-ignore "/var/cache/" --add-ignore "/root/.npm/"
 # mtls mode, optional: leave the client-cert CA out, so its key stays single-copy.
 kopia policy set /etc --add-ignore "/nginx/agent-box/"
 
@@ -248,9 +261,11 @@ your password manager now. `b2.env` itself is not backed up.
 ### Alerts (optional)
 
 Make a check at [healthchecks.io](https://healthchecks.io) with a 1 hour
-period and put its ping URL in `b2.env` as `HC_URL`. The script pings it when
-it starts and with its exit code when it ends, so a missed or failed backup
-sends you an email.
+period (grace: a few hours, for the first long upload) and put its ping URL
+in `b2.env` as `HC_URL`. The script pings it when it starts and when it ends,
+so a missed or failed backup, a nearly full disk or a failed read-back sends
+you an email. On failure the reason goes in the ping body, which healthchecks
+puts in the email.
 
 ### Day to day
 
@@ -295,6 +310,36 @@ in the B2 web UI ("Show all versions") and Kopia sees them again.
 - **A running backup shows as `activating`, not `active`.** That's how
   `Type=oneshot` services look while they run, so `make backup-status`
   checks for `activating`.
+
+## Network guard
+
+Agents read web pages and install packages, so assume one will eventually
+follow a malicious instruction. The container can still reach the whole
+internet (pip, npm, GitHub, APIs all work), but `firewall/guard.sh` stops it
+from using the box as a step towards anything else:
+
+- **Dropped:** the host itself (its sshd, databases, other apps) except ports
+  80/443; the cloud metadata service at 169.254.169.254 (which on some clouds
+  hands out credentials); private ranges 10/8, 172.16/12, 192.168/16; and
+  Tailscale's 100.64/10, so in tailscale mode agents can't reach your other
+  devices.
+- **Unaffected:** traffic the host starts (SSH jump, `tailscale serve`/nginx to
+  T3, docker's port publishing). Replies match "established".
+- It's its own nftables table (`inet agent_box_guard`), so ufw and docker never
+  rewrite or flush it. Needs `nft` (package `nftables`, installed by
+  default on current Debian/Ubuntu). `agent-box-guard.service` applies it at boot.
+- The rules match the docker bridge name, which changes when compose recreates
+  the network. `make up` re-applies the guard and `make doctor` warns if it's
+  aimed at an old bridge.
+
+```sh
+sudo make guard-link   # install + start (once)
+make net-test          # from inside the container: what's open, what's blocked
+sudo make guard-off    # lift it until the next boot or `make up`
+```
+
+The container is also capped at 4096 processes (`pids_limit`), so a runaway
+agent can't exhaust the host's process table.
 
 ## Secrets
 

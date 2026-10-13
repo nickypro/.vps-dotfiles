@@ -30,6 +30,7 @@ DOMAIN ?= code.example.com
         host-config host-config-tailscale host-config-mtls host-config-public fail2ban-config \
         ca cert client-cert-list web-passwd \
         backup-link backup-status backup-now \
+        guard-link guard-off net-test \
         status status-tailscale status-mtls status-public ps \
         doctor doctor-tailscale doctor-mtls doctor-public
 
@@ -45,6 +46,8 @@ up:  ## Start (or recreate) the container
 > @test -f authorized_keys || { echo "create ./authorized_keys first (see authorized_keys.example)"; exit 1; }
 > mkdir -p ssh_host_keys
 > $(COMPOSE) up -d
+> @# compose may have recreated the network (new bridge name), so re-aim the guard.
+> @systemctl restart agent-box-guard 2>/dev/null && echo "  network guard re-applied" || echo "  network guard NOT re-applied: sudo systemctl restart agent-box-guard (first time: sudo make guard-link)"
 
 down:  ## Stop and remove the container (volume data is untouched)
 > $(COMPOSE) down
@@ -166,6 +169,19 @@ backup-now:  ## Start a backup now, in the background
 > systemctl start --no-block agent-box-backup.service
 > @echo "  started - follow it with: journalctl -fu agent-box-backup"
 
+## --- network guard (container -> host / internal addresses) -------------
+guard-link:  ## Install the nftables guard that keeps the container off the host
+> ln -sfn $(CURDIR)/firewall/guard.sh /usr/local/sbin/agent-box-guard
+> systemctl link $(CURDIR)/firewall/agent-box-guard.service
+> systemctl daemon-reload && systemctl enable agent-box-guard && systemctl restart agent-box-guard
+
+guard-off:  ## Lift the guard until the next boot or `make up` (for debugging)
+> systemctl stop agent-box-guard
+
+net-test:  ## Show what the container can reach (run after any firewall change)
+> @docker cp $(CURDIR)/firewall/net-probe.sh $(NAME):/tmp/net-probe.sh
+> @docker exec -u dev $(NAME) bash /tmp/net-probe.sh "$$(ip -4 route get 1.1.1.1 | grep -o 'src [0-9.]*' | cut -d' ' -f2)"; docker exec $(NAME) rm -f /tmp/net-probe.sh
+
 ## --- checks -------------------------------------------------------------
 status: ps  ## Show container, web access and fail2ban status
 > @echo "--- t3:";      docker exec $(NAME) su dev -s /bin/sh -c 'tmux ls' 2>&1 | sed 's/^/  /'
@@ -195,6 +211,8 @@ doctor:  ## Verify the things that have broken before
 > @docker exec $(NAME) ps -eo args | grep -q -- "t3 serve.*--host 0.0.0.0" && echo "  t3 bound to 0.0.0.0 OK" || echo "  WARNING: t3 not on 0.0.0.0 - the web UI will 502"
 > @echo "checking host key persistence..."
 > @ls $(CURDIR)/ssh_host_keys/ssh_host_ed25519_key >/dev/null 2>&1 && echo "  host keys persisted OK" || echo "  WARNING: host keys not persisted"
+> @echo "checking network guard..."
+> @B=br-$$(docker network inspect -f '{{.Id}}' $(NAME)_default | cut -c1-12); nft list table inet agent_box_guard 2>/dev/null | grep -q "\"$$B\"" && echo "  guard active on $$B" || echo "  WARNING: guard missing or aimed at an old bridge (sudo make guard-link)"
 > @echo "checking web access (ACCESS=$(ACCESS))..."
 > @$(MAKE) --no-print-directory doctor-$(ACCESS)
 

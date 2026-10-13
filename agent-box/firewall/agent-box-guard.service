@@ -1,0 +1,13 @@
+[Unit]
+Description=Firewall the agent-box container off the host and internal networks
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/agent-box-guard
+ExecStop=/usr/sbin/nft delete table inet agent_box_guard
+
+[Install]
+WantedBy=multi-user.target
