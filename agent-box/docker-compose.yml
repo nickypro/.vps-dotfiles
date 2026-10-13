@@ -10,7 +10,8 @@ services:
     hostname: agent-box
 
     # Loopback only. Nothing new faces the internet: SSH arrives by jumping
-    # through the host's own sshd, and the web UI only via nginx on 443.
+    # through the host's own sshd, and the web UI only via `tailscale serve`
+    # or nginx on 443 (ACCESS in config.mk).
     ports:
       - "127.0.0.1:2222:2222"
       - "127.0.0.1:3773:3773"

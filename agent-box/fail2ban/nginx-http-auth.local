@@ -1,0 +1,13 @@
+# Bans an IP after repeated wrong passwords at the nginx prompt. Only used in
+# the mtls and public modes: `make host-config` links it into
+# /etc/fail2ban/jail.d/ there, and removes it in tailscale mode.
+#
+# The nginx-http-auth filter ships with fail2ban. findtime and maxretry come
+# from jail.local.
+[nginx-http-auth]
+enabled = true
+# Longer than the SSH jail: here a password really is what keeps people out.
+bantime = 1h
+# Read nginx's error log file even if the distro defaults every jail to the
+# systemd journal, which never sees that log.
+backend = auto

@@ -1,0 +1,36 @@
+#!/bin/sh
+# Hourly encrypted snapshot of the agent box to Backblaze B2, run by
+# agent-box-backup.timer. Runs on the HOST on purpose: the agent container
+# cannot see /root/backup, so no agent can reach these credentials.
+#
+# Locks: compliance-mode Object Lock, 14 days, extended by kopia's full
+# maintenance. A B2 lifecycle rule purges hidden versions 15 days after hiding.
+# Restore:  kopia snapshot list --all   /   kopia restore <id>/<path> <dest>
+set -eu
+
+# This agent-box directory, found through the /usr/local/sbin symlink. It holds
+# the files git ignores: authorized_keys and ssh_host_keys/.
+BOX_DIR=$(dirname "$(dirname "$(readlink -f "$0")")")
+
+# What to back up: one path per line, no spaces. Each becomes its own
+# snapshot source in kopia. Skips (.cache/, node_modules/, ...) are kopia
+# policies; see the README.
+SOURCES="
+/srv/agent-box
+$BOX_DIR
+/etc
+/root
+"
+
+set -a; . /root/backup/b2.env; set +a
+export KOPIA_CHECK_FOR_UPDATES=false
+
+[ -n "${HC_URL:-}" ] && curl -fsS -m 10 --retry 3 -o /dev/null "$HC_URL/start" || true
+
+rc=0
+# shellcheck disable=SC2086  # splitting SOURCES into paths is the point
+kopia snapshot create --no-progress $SOURCES || rc=$?
+
+# Optional alerting: put HC_URL=https://hc-ping.com/<uuid> in b2.env.
+[ -n "${HC_URL:-}" ] && curl -fsS -m 10 --retry 3 -o /dev/null "$HC_URL/$rc" || true
+exit $rc

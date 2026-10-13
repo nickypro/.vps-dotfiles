@@ -1,0 +1,19 @@
+[Unit]
+Description=Back up the agent box to Backblaze B2 (kopia)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# kopia finds its config through $HOME; without this it reports
+# "repository is not connected".
+Environment=HOME=/root
+# The first full upload takes hours; never time it out.
+TimeoutStartSec=infinity
+ExecStart=/usr/local/sbin/agent-box-backup
+# Stay out of the way of the agent container.
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=150%
+MemoryHigh=1200M
+MemoryMax=2G
