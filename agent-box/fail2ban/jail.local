@@ -1,0 +1,18 @@
+[DEFAULT]
+# Ban length. Deliberately short: with password auth disabled, no attacker can
+# actually get in, so this is about cutting log noise -- not the thing keeping
+# the box safe. A short ban also means any self-inflicted ban clears quickly.
+bantime  = 15m
+findtime = 10m
+maxretry = 6
+
+# Never ban loopback. Add your own IP here if it is stable.
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+# IMPORTANT: "normal" mode treats a failed *publickey* attempt as NOFAIL, so
+# offering several keys never counts toward a ban. "aggressive" mode does count
+# them and would ban you for having multiple keys. Pinned here so a future
+# change to the packaged default cannot silently start banning you.
+mode = normal

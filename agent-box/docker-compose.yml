@@ -1,0 +1,37 @@
+services:
+  agent-box:
+    build:
+      context: .
+      args:
+        TZ: Etc/UTC
+    image: agent-box
+    container_name: agent-box
+    restart: unless-stopped
+    hostname: agent-box
+
+    # Loopback only. Nothing new faces the internet: SSH arrives by jumping
+    # through the host's own sshd, and the web UI only via nginx on 443.
+    ports:
+      - "127.0.0.1:2222:2222"
+      - "127.0.0.1:3773:3773"
+
+    volumes:
+      # Everything worth keeping lives on the host, so `make rebuild` is safe.
+      - /srv/agent-box/home:/home/dev
+      - /srv/agent-box/data:/data
+      # Host-managed key file: rotate access without touching the volume.
+      - ./authorized_keys:/etc/ssh/authorized_keys.d/dev:ro
+      # Persist host keys so rebuilds do not change the SSH fingerprint.
+      - ./ssh_host_keys:/etc/ssh/host_keys
+
+    environment:
+      - TZ=Etc/UTC
+
+    # Cap the container so a busy agent session cannot OOM-kill whatever else
+    # runs on the host. Tune to your machine.
+    mem_limit: 5g
+    memswap_limit: 9g
+    cpus: 3.5
+
+    # Deliberately NOT mounting the docker socket: an agent that can reach
+    # dockerd is effectively root on the host.

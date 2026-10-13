@@ -1,0 +1,4 @@
+# Private SSH host keys, generated on first start.
+ssh_host_keys/
+# Your real key list.
+authorized_keys
