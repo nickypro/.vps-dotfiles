@@ -92,32 +92,23 @@ RUN set -e; has() { case " $EXTRAS " in *" $1 "*) return 0;; esac; return 1; }; 
 
 # Isolated agents ("cells") and the pieces that keep them isolated. See
 # cells/cell-admin. The git shim goes ahead of /usr/bin/git for everyone;
-# /opt/agent-box/bin (claude/codex guards, `cell`, t3-serve) is first on
-# PATH for T3 and for your interactive shells.
+# /opt/agent-box/bin (claude/codex guards, `cell`, `claude-account`,
+# t3-serve) is first on PATH for T3 and for your interactive shells.
+# box-notes.md tells the agents how the box works (bin/box-notes points
+# Claude and Codex at it on every start).
 COPY cells/ /opt/agent-box/cells/
-COPY cells.conf /opt/agent-box/cells.conf
+COPY cells.conf box-notes.md agent-box.zsh /opt/agent-box/
 COPY bin/ /opt/agent-box/bin/
 COPY extras/ /opt/agent-box/extras/
 RUN chmod 755 /opt/agent-box/cells/* /opt/agent-box/bin/* \
- && chmod 644 /opt/agent-box/cells/lib.sh /opt/agent-box/cells.conf \
+ && chmod 644 /opt/agent-box/cells/lib.sh /opt/agent-box/cells.conf /opt/agent-box/box-notes.md /opt/agent-box/agent-box.zsh \
  && ln -sf ../cells/agent-guard /opt/agent-box/bin/claude \
  && ln -sf ../cells/agent-guard /opt/agent-box/bin/codex \
  && ln -sf ../cells/cell /opt/agent-box/bin/cell \
  && ln -sf /opt/agent-box/cells/git /usr/local/bin/git \
  && ln -sf /opt/agent-box/extras/desktop/desktop /opt/agent-box/bin/desktop \
  && ln -sf /opt/agent-box/extras/synthv/synthv /opt/agent-box/bin/synthv \
- && printf '%s\n' '' \
-      '# agent-box: /opt/agent-box/bin first (cell, desktop, and the claude/codex' \
-      '# guards for isolated agents), and a reminder inside an agent'"'"'s folder.' \
-      'case ":$PATH:" in *:/opt/agent-box/bin:*) ;; *) PATH=/opt/agent-box/bin:$PATH ;; esac' \
-      '_agent_box_cell_hint() {' \
-      '  case $PWD/ in /cells/*/*) local n=${PWD#/cells/}; n=${n%%/*}' \
-      '    [[ ${_agent_box_cell-} == $n ]] || print -P "%F{yellow}This folder belongs to the isolated agent $n. You are still dev here, so do not run its scripts; cell $n gives you its shell.%f"' \
-      '    _agent_box_cell=$n ;;' \
-      '  *) _agent_box_cell= ;; esac' \
-      '}' \
-      'autoload -Uz add-zsh-hook && add-zsh-hook chpwd _agent_box_cell_hint && _agent_box_cell_hint' \
-      >> /etc/zsh/zshrc
+ && printf '\n%s\n' '. /opt/agent-box/agent-box.zsh   # agent-box: PATH, claude-<account>, cell hint' >> /etc/zsh/zshrc
 
 # sshd. Keys come ONLY from a host-managed file mounted read-only at
 # /etc/ssh/authorized_keys.d/dev, so access is rotated without touching the

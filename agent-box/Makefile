@@ -28,6 +28,7 @@ endif
 DOMAIN ?= code.example.com
 
 .PHONY: help build up down restart rebuild update logs shell t3-logs t3-restart pair secret \
+        claude-account claude-accounts claude-account-rm \
         cell cells cell-share cell-unshare cell-rm \
         host-config host-config-tailscale host-config-mtls host-config-public fail2ban-config \
         ca cert cert-revoke client-cert-list web-passwd \
@@ -97,6 +98,21 @@ secret:  ## Save an API key for the agents (asks for it, hidden):  make secret K
 > @read -rsp "  value for $(KEY) (not shown): " v && echo && \
    docker exec -i $(NAME) /opt/agent-box/bin/set-secret "$(KEY)" $(CELL) <<< "$$v"
 > @test -n "$(CELL)" || echo "  make t3-restart, so agents T3 starts see it too"
+
+## --- more Claude logins (see README) -----------------------------------
+# EMAIL only from the command line: some shells set EMAIL for other tools.
+LOGIN_EMAIL = $(if $(filter command line,$(origin EMAIL)),$(EMAIL))
+claude-account:  ## Another Claude login, its own provider in T3:  make claude-account ACCOUNT=work [LABEL=Work] [COLOR=15803d]
+> @test -n "$(ACCOUNT)" || { echo "usage: make claude-account ACCOUNT=<name> [LABEL=<name in T3>] [COLOR=rrggbb] [EMAIL=<login>]"; exit 1; }
+> @t=; [ -t 0 ] && t=-t; docker exec -i $$t -u dev -e HOME=/home/dev -e EMAIL="$(LOGIN_EMAIL)" $(NAME) \
+   /opt/agent-box/bin/claude-account add "$(ACCOUNT)" "$(LABEL)" "$(COLOR)"
+
+claude-accounts:  ## List the Claude logins, their names in T3 and who is logged in
+> @docker exec -u dev -e HOME=/home/dev $(NAME) /opt/agent-box/bin/claude-account list
+
+claude-account-rm:  ## Take a Claude login out of T3 (its folder and login stay):  make claude-account-rm ACCOUNT=work
+> @test -n "$(ACCOUNT)" || { echo "usage: make claude-account-rm ACCOUNT=<name>"; exit 1; }
+> docker exec -u dev -e HOME=/home/dev $(NAME) /opt/agent-box/bin/claude-account rm "$(ACCOUNT)"
 
 ## --- isolated agents ("cells"; see README) -----------------------------
 cell:  ## New isolated agent: own user + folder, own providers in T3:  make cell CELL=web

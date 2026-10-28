@@ -29,6 +29,10 @@ if [ ! -f /home/dev/.zshrc ]; then
   echo "entrypoint: seeded /home/dev/.zshrc"
 fi
 
+# Notes that tell Claude and Codex how the box works: made once, and Codex's
+# copy refreshed, without touching anything you wrote (bin/box-notes).
+su dev -s /bin/sh -c /opt/agent-box/bin/box-notes || echo "entrypoint: warning - box-notes failed" >&2
+
 # --- isolated agents ----------------------------------------------------
 # Their users live in the image layer, which a rebuild replaces: recreate
 # them from /cells/*/.cell (on the host volume) before anything can start one.

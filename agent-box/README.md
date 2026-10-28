@@ -199,6 +199,7 @@ make update        # latest claude, codex and t3, in place, then restart T3
 make rebuild       # fresh base image + latest CLIs, recreate the container
 make t3-restart    # restart T3 without dropping SSH sessions
 make secret KEY=OPENAI_API_KEY  # save an API key for the agents (asks, hidden)
+make claude-account ACCOUNT=work  # one more Claude login in T3 (see More Claude accounts)
 make cell CELL=web              # a new isolated agent (see Isolated agents)
 make pair LABEL=phone           # T3 pairing link for one more device
 make cert NAME_ARG=phone        # mtls: client cert for a new device
@@ -208,6 +209,48 @@ make cert-revoke NAME_ARG=phone # mtls: refuse that cert from now on
 `make update` is quick but lives in the container's own layer, which a
 recreate throws away. `make rebuild` re-downloads the base image (security
 fixes) and the CLIs (at most once a day), so it never rolls you back.
+
+## Notes for the agents, and more Claude accounts
+
+**Notes.** `box-notes.md` tells the agents how this box works: which
+folders survive a rebuild (so they install tools into your home, not with
+apt), the memory and CPU caps, why the server and private networks time out,
+how to show you a dev server, where API keys are, and to keep away from the
+isolated agents' folders. The image puts it in `/opt/agent-box`, and on every
+start `bin/box-notes` points both agents at it:
+
+- `~/.claude/CLAUDE.md` (your notes for every project) is made once, with
+  the line `@/opt/agent-box/box-notes.md`, which pulls the file in. Add your
+  own notes under it. If you already had a `CLAUDE.md`, nothing changes:
+  add that line yourself (the container log reminds you).
+- Codex can't pull files in, so `~/.codex/AGENTS.md` holds a copy between
+  two marker lines, refreshed on every start. Your notes go after the end
+  line; delete the markers to keep your own version.
+
+**More Claude accounts.** Log in a second account (work and personal, or a
+second subscription for more usage) and it shows up in T3 as its own
+provider, with its own name and colour in the model menu:
+
+```sh
+make claude-account ACCOUNT=work                     # asks you to log in, then adds "Work" to T3
+make claude-account ACCOUNT=work LABEL=HOF COLOR=15803d EMAIL=you@work.com
+make claude-account ACCOUNT=main LABEL=Me            # name (and colour) your first login too
+make claude-accounts                                 # who is logged in where
+make claude-account-rm ACCOUNT=work                  # out of T3; its folder and login stay
+```
+
+- Each account has its own folder, `~/.claude-work`, which T3 hands to
+  Claude as `CLAUDE_CONFIG_DIR`: its own login, history, settings and
+  plugins.
+- `CLAUDE.md`, `rules/`, `skills/`, `agents/` and `commands/` in it are
+  links to the ones in `~/.claude`, so all your accounts share the same
+  notes and skills.
+- In a shell in the box, `claude-work` runs Claude as that account (in new
+  shells).
+- Log in fresh on each machine rather than copying `.credentials.json`
+  around: when one copy renews the login, the other can get logged out.
+- Colours are picked dark enough for T3 to put white text on the badge.
+  Amber is kept for isolated agents.
 
 ## Isolated agents ("cells")
 

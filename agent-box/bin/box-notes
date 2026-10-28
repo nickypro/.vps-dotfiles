@@ -1,0 +1,46 @@
+#!/bin/sh
+# Points Claude and Codex at /opt/agent-box/box-notes.md, which tells agents
+# how this box works (box-notes.md in the repo). The entrypoint runs this as
+# dev at every start. It never changes your own notes:
+#  - Claude: ~/.claude/CLAUDE.md is made once, and pulls the notes in with
+#    an @ line, so Claude always reads the current version.
+#  - Codex can't pull files in, so ~/.codex/AGENTS.md keeps a copy between
+#    two marker lines, refreshed here. Delete the markers to stop that.
+set -eu
+notes=/opt/agent-box/box-notes.md
+[ -r "$notes" ] || exit 0
+mkdir -p "$HOME/.claude" "$HOME/.codex"
+
+f=$HOME/.claude/CLAUDE.md
+if [ ! -e "$f" ]; then
+  cat >"$f" <<EOF
+# Notes for every project
+
+Claude Code reads this at the start of every session, for every Claude
+account in this box. The next line pulls in how the box works.
+
+@$notes
+
+## My notes
+
+EOF
+  echo "box-notes: made $f"
+elif ! grep -qF "@$notes" "$f"; then
+  echo "box-notes: to give Claude the box notes, add this line to $f: @$notes"
+fi
+
+begin="<!-- agent-box notes: copied from $notes at every start. Your own notes go after the end line. -->"
+end="<!-- end of agent-box notes -->"
+f=$HOME/.codex/AGENTS.md
+if [ ! -e "$f" ]; then
+  { echo "$begin"; cat "$notes"; echo "$end"; printf '\n# My notes\n\n'; } >"$f"
+  echo "box-notes: made $f"
+elif grep -qxF "$begin" "$f" && grep -qxF "$end" "$f"; then
+  tmp=$(mktemp "$f.XXXXXX")
+  awk -v b="$begin" -v e="$end" -v n="$notes" '
+    $0 == b { print; while ((getline line < n) > 0) print line; skip = 1; next }
+    $0 == e { skip = 0 }
+    !skip' "$f" >"$tmp"
+  cmp -s "$tmp" "$f" || cat "$tmp" >"$f"
+  rm -f "$tmp"
+fi

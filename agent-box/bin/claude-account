@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""More Claude logins in the box, each its own provider in T3 (a work and a
+personal account side by side, say). Runs as dev; `make claude-account` on
+the host calls it.
+
+  claude-account add <name> [label] [#colour]   log it in, then add it to T3
+  claude-account name <name|main> <label> [#colour]
+                                                rename or recolour it in T3
+  claude-account list
+  claude-account rm <name>                      take it out of T3 (its folder
+                                                and login stay)
+
+Account <name> lives in ~/.claude-<name>, which T3 hands to Claude Code as
+CLAUDE_CONFIG_DIR. Its CLAUDE.md, rules, skills, agents and commands are
+links to ~/.claude's, so every account reads the same notes and skills;
+logins, history, settings and plugins stay separate. "main" is your first
+login, in ~/.claude. New zsh shells get a `claude-<name>` command.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+MAIN = os.path.join(HOME, ".claude")
+SETTINGS = os.path.join(HOME, ".t3/userdata/settings.json")
+GUARD = "/opt/agent-box/bin/claude"  # refuses to start in an isolated agent's folder
+CLAUDE = GUARD if os.access(GUARD, os.X_OK) else "claude"
+SHARED = ("CLAUDE.md", "rules", "skills", "agents", "commands")
+# Dark enough that T3 puts white text on the badge. Amber is the cells' colour.
+PALETTE = ("#1d4ed8", "#15803d", "#7e22ce", "#be123c", "#0f766e", "#4338ca", "#a21caf", "#0369a1")
+
+
+def die(msg):
+    print(f"claude-account: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def check_name(name):
+    if not re.fullmatch(r"[a-z][a-z0-9]{0,19}", name or ""):
+        die(f"name: lowercase letters and digits, starting with a letter (got '{name}')")
+
+
+def check_colour(colour):
+    if not colour:
+        return None
+    if not re.fullmatch(r"#?[0-9a-fA-F]{6}", colour):
+        die(f"colour: six-digit hex like 15803d (got '{colour}')")
+    return "#" + colour.lstrip("#").lower()
+
+
+def folder(name):
+    return MAIN if name == "main" else os.path.join(HOME, f".claude-{name}")
+
+
+def instance_id(name):
+    return "claudeAgent" if name == "main" else f"claude-{name}"
+
+
+def claude_env(config_dir):
+    env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    # The main login keeps .claude.json in your home, not in ~/.claude, so
+    # it must run without CLAUDE_CONFIG_DIR, just as T3 starts it.
+    if config_dir != MAIN:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    return env
+
+
+def status(config_dir):
+    try:
+        out = subprocess.run([CLAUDE, "auth", "status", "--json"], env=claude_env(config_dir),
+                             cwd=HOME, capture_output=True, text=True, timeout=60).stdout
+        return json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def load():
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f), os.stat(SETTINGS).st_mode & 0o777
+    except FileNotFoundError:
+        return {}, 0o600
+
+
+def save(d, mode):
+    # T3 notices the change by itself. Replace the file in one step, so it
+    # never reads half of one.
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(SETTINGS), prefix=".settings.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, SETTINGS)
+
+
+def pick_colour(pi, iid):
+    used = {str(v.get("accentColor", "")).lower() for k, v in pi.items() if k != iid}
+    return next((c for c in PALETTE if c not in used), PALETTE[0])
+
+
+def cmd_add(name, label=None, colour=None):
+    if name == "main":
+        return cmd_name(name, label, colour)
+    check_name(name)
+    colour = check_colour(colour)
+    d = folder(name)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    subprocess.run(["/opt/agent-box/bin/box-notes"], check=False)  # makes ~/.claude/CLAUDE.md if missing
+    for s in SHARED:
+        src, dst = os.path.join(MAIN, s), os.path.join(d, s)
+        if s != "CLAUDE.md":
+            os.makedirs(src, exist_ok=True)
+        if os.path.exists(src) and not os.path.lexists(dst):
+            os.symlink(os.path.join("..", ".claude", s), dst)
+
+    just_logged_in = False
+    st = status(d)
+    if not st.get("loggedIn"):
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            die(f"log it in first, in a terminal in the box:\n"
+                f"    CLAUDE_CONFIG_DIR=~/.claude-{name} claude auth login\n"
+                f"  then run this again.")
+        print(f"  Log in the account for '{name}'. Open the link, sign in, and paste the code back here.")
+        email = os.environ.get("EMAIL")
+        subprocess.run([CLAUDE, "auth", "login"] + (["--email", email] if email else []),
+                       env=claude_env(d), cwd=HOME)
+        st, just_logged_in = status(d), True
+        if not st.get("loggedIn"):
+            die("not logged in, so it's not in T3 yet. Run this again to retry.")
+
+    data, mode = load()
+    pi = data.setdefault("providerInstances", {})
+    iid = instance_id(name)
+    existed = iid in pi
+    inst = pi.setdefault(iid, {})
+    inst["driver"] = "claudeAgent"
+    inst["displayName"] = label or inst.get("displayName") or name.capitalize()
+    inst["accentColor"] = colour or inst.get("accentColor") or pick_colour(pi, iid)
+    inst.setdefault("config", {}).update(binaryPath=GUARD, homePath=d)
+    if existed and just_logged_in and inst.get("enabled", True):
+        # T3 remembers "not logged in" until the provider is switched off and on.
+        inst["enabled"] = False
+        save(data, mode)
+        time.sleep(3)
+    inst["enabled"] = True
+    save(data, mode)
+    who = st.get("email") or "logged in"
+    plan = f", {st['subscriptionType']}" if st.get("subscriptionType") else ""
+    print(f"  {inst['displayName']} ({who}{plan}) is in T3: pick it in a thread's model menu.\n"
+          f"  In a new shell: claude-{name}")
+
+
+def cmd_name(name, label=None, colour=None):
+    if name != "main":
+        check_name(name)
+    colour = check_colour(colour)
+    if not label and not colour:
+        die("usage: claude-account name <name|main> <label> [#colour]")
+    data, mode = load()
+    pi = data.setdefault("providerInstances", {})
+    iid = instance_id(name)
+    if iid not in pi and name != "main":
+        die(f"no account '{name}' in T3 (claude-account add {name})")
+    inst = pi.setdefault(iid, {"driver": "claudeAgent"})
+    if label:
+        inst["displayName"] = label
+    if colour:
+        inst["accentColor"] = colour
+    cfg = inst.setdefault("config", {})
+    if cfg.get("binaryPath", "") in ("", "claude", "/usr/local/bin/claude"):
+        cfg["binaryPath"] = GUARD
+    save(data, mode)
+    print(f"  {name}: {inst.get('displayName', 'Claude')} {inst.get('accentColor', '')}".rstrip())
+
+
+def cmd_rm(name):
+    check_name(name)
+    data, mode = load()
+    if data.get("providerInstances", {}).pop(instance_id(name), None) is None:
+        die(f"no account '{name}' in T3")
+    save(data, mode)
+    print(f"  {name} is out of T3. Its login and history are still in ~/.claude-{name}. To sign\n"
+          f"  it out and delete them: CLAUDE_CONFIG_DIR=~/.claude-{name} claude auth logout && rm -rf ~/.claude-{name}")
+
+
+def cmd_list():
+    data, _ = load()
+    pi = data.get("providerInstances", {})
+    rows, seen = [], set()
+    # Every Claude provider in T3 except the cells', then folders T3 doesn't know.
+    for iid, inst in pi.items():
+        if inst.get("driver") != "claudeAgent" or iid.startswith("cell-"):
+            continue
+        d = (inst.get("config") or {}).get("homePath") or MAIN
+        name = "main" if iid == "claudeAgent" else iid.removeprefix("claude-")
+        t3 = inst.get("displayName") or "Claude"
+        if inst.get("accentColor"):
+            t3 += f" {inst['accentColor']}"
+        if inst.get("enabled") is False:
+            t3 += " (off)"
+        rows.append((name, d, t3))
+        seen.add(os.path.realpath(d))
+    if "claudeAgent" not in pi:
+        rows.insert(0, ("main", MAIN, "Claude"))
+        seen.add(os.path.realpath(MAIN))
+    for e in sorted(os.listdir(HOME)):
+        m = re.fullmatch(r"\.claude-([a-z][a-z0-9]{0,19})", e)
+        d = os.path.join(HOME, e)
+        if m and os.path.isdir(d) and os.path.realpath(d) not in seen:
+            rows.append((m.group(1), d, "not in T3"))
+    rows.sort(key=lambda r: r[0] != "main")  # your first login on top
+    print(f"  {'ACCOUNT':<10} {'FOLDER':<22} {'IN T3':<20} LOGIN")
+    for name, d, t3 in rows:
+        st = status(d)
+        login = st.get("email") or ("logged in" if st.get("loggedIn") else "-")
+        if st.get("subscriptionType"):
+            login += f" ({st['subscriptionType']})"
+        print(f"  {name:<10} {d.replace(HOME, '~', 1):<22} {t3:<20} {login}")
+
+
+def main(argv):
+    cmd, args = (argv[0] if argv else ""), [a or None for a in argv[1:]]
+    if os.geteuid() == 0:
+        die("run as dev, not root (make claude-account on the host does)")
+    if cmd == "add" and 1 <= len(args) <= 3:
+        cmd_add(*args)
+    elif cmd == "name" and 2 <= len(args) <= 3:
+        cmd_name(*args)
+    elif cmd == "rm" and len(args) == 1:
+        cmd_rm(args[0])
+    elif cmd == "list" and not args:
+        cmd_list()
+    else:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        sys.exit(64)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
