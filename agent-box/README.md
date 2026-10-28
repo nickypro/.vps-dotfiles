@@ -232,7 +232,7 @@ in that folder, on purpose.
 
 | | your agents (`dev`) | a cell |
 |---|---|---|
-| Files | everything in the box | `/cells/web` (its home, work and `shared/` folders) and world-readable system files |
+| Files | everything in the box | `/cells/web` (its home, work and `shared/` folders) and world-readable system files; it can't list `/tmp`, where your agents leave files |
 | sudo | yes | no |
 | Your logins, `~/.env`, T3's settings | yes | no; it has its own |
 | T3's tools (start threads, hand work to other agents) | yes | no |
@@ -255,6 +255,12 @@ it. A read-write share of anything holding a git repo is refused: the cell
 could leave settings in it (a git hook, `core.fsmonitor`, a changed
 `package.json` script) that run its code the next time *you* use git or the
 project's scripts there. Share those read-only, or `import` a copy.
+
+**Your own layout.** Cells can read anything world-readable, so `make cell`
+takes "other" permissions off `/home/dev` and `/data`, and lets cells create
+files in `/tmp` and `/var/tmp` but not list them. If your box keeps private
+files elsewhere, list those folders in `cells.conf` (copied to
+`/opt/agent-box/cells.conf` in the image; see `cells/lib.sh`).
 
 **How T3 runs a cell.** The cell's providers have their binary path set to
 `/opt/agent-box/cell-bin/claude-web` (and `codex-web`). That wrapper checks

@@ -88,7 +88,7 @@ table inet agent_box_cells {
 EOF
   nsenter -t "$pid" -m mount -o remount,hidepid=invisible,gid=1000 /proc
   # Folders shared read-only with a cell (make cell-share): read-only in here too.
-  "$(dirname "$(readlink -f "$0")")/../cells/host-share" ro-inside || true
+  BOX=$NAME "$(dirname "$(readlink -f "$0")")/../cells/host-share" ro-inside || true
   echo "guard: cell table and hidden processes in $NAME (pid $pid)"
 }
 

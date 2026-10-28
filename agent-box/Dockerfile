@@ -95,10 +95,11 @@ RUN set -e; has() { case " $EXTRAS " in *" $1 "*) return 0;; esac; return 1; }; 
 # /opt/agent-box/bin (claude/codex guards, `cell`, t3-serve) is first on
 # PATH for T3 and for your interactive shells.
 COPY cells/ /opt/agent-box/cells/
+COPY cells.conf /opt/agent-box/cells.conf
 COPY bin/ /opt/agent-box/bin/
 COPY extras/ /opt/agent-box/extras/
 RUN chmod 755 /opt/agent-box/cells/* /opt/agent-box/bin/* \
- && chmod 644 /opt/agent-box/cells/lib.sh \
+ && chmod 644 /opt/agent-box/cells/lib.sh /opt/agent-box/cells.conf \
  && ln -sf ../cells/agent-guard /opt/agent-box/bin/claude \
  && ln -sf ../cells/agent-guard /opt/agent-box/bin/codex \
  && ln -sf ../cells/cell /opt/agent-box/bin/cell \

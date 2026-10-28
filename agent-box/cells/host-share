@@ -13,10 +13,20 @@
 #   host-share ro-inside   re-apply read-only inside the container (the guard
 #                          runs this whenever the container starts)
 set -euo pipefail
-SRV=/srv/agent-box
+# Which container, and where its /cells lives on the host. Both come from
+# the Makefile; the folder is otherwise read from the container's mounts.
+BOX=${BOX:-agent-box}
 die() { echo "  $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root: sudo make ..."
 command -v setfacl >/dev/null || die "needs setfacl: sudo apt install acl"
+
+# "host-path container-path" for each of the container's mounts.
+MOUNTS=$(docker inspect -f '{{range .Mounts}}{{.Source}} {{.Destination}}{{"\n"}}{{end}}' "$BOX" 2>/dev/null || true)
+CELLS_HOST=${CELLS_HOST:-$(awk '$2 == "/cells" { print $1 }' <<<"$MOUNTS")}
+if [ -z "$CELLS_HOST" ] || [ ! -d "$CELLS_HOST" ]; then
+  [ "${1-}" != ro-inside ] || exit 0      # no cells on this box: nothing to do
+  die "can't find the host folder behind /cells (is $BOX running? CELLS_HOST=...)"
+fi
 
 # A bind mount made read-only on the host can still arrive writable in the
 # container: the copy that propagates in is taken before the read-only step.
@@ -24,33 +34,36 @@ command -v setfacl >/dev/null || die "needs setfacl: sudo apt install acl"
 fstab_unescape() { local s=${1//\\040/ }; s=${s//\\011/$'\t'}; printf '%s' "${s//\\134/\\}"; }
 ro_inside() {
   local pid dst
-  pid=$(docker inspect -f '{{.State.Pid}}' agent-box 2>/dev/null) || return 0
+  pid=$(docker inspect -f '{{.State.Pid}}' "$BOX" 2>/dev/null) || return 0
   [ "$pid" -gt 0 ] || return 0
   awk '$4 ~ /x-agent-box-cell=/ && $4 ~ /(^|,)ro(,|$)/ { print $2 }' /etc/fstab | while read -r dst; do
     dst=$(fstab_unescape "$dst")
-    nsenter -t "$pid" -m mount -o remount,bind,ro "/cells${dst#"$SRV/cells"}" 2>/dev/null || true
+    case $dst in "$CELLS_HOST"/*) ;; *) continue ;; esac
+    nsenter -t "$pid" -m mount -o remount,bind,ro "/cells${dst#"$CELLS_HOST"}" 2>/dev/null || true
   done
 }
 if [ "${1-}" = ro-inside ]; then ro_inside; exit 0; fi
 
 if [ "${1-}" = list ]; then
-  findmnt -rn -o SOURCE,TARGET,OPTIONS | awk -v p="$SRV/cells/" 'index($2, p) == 1 {
+  findmnt -rn -o SOURCE,TARGET,OPTIONS | awk -v p="$CELLS_HOST/" 'index($2, p) == 1 {
     split(substr($2, length(p) + 1), a, "/"); printf "  %-10s %-16s %s %s\n", a[1], a[3], ($3 ~ /(^|,)ro(,|$)/ ? "ro" : "RW"), $1 }'
   exit 0
 fi
 
 cmd=${1-} cell=${2-}
-[[ $cell =~ ^[a-z][a-z0-9]{0,19}$ ]] && [ -f "$SRV/cells/$cell/.cell" ] || die "no cell called '$cell' (make cells)"
-uid=$(sed -n 's/^uid=\([0-9]*\)$/\1/p' "$SRV/cells/$cell/.cell")
-[ -n "$uid" ] || die "no uid in $SRV/cells/$cell/.cell"
+[[ $cell =~ ^[a-z][a-z0-9]{0,19}$ ]] && [ -f "$CELLS_HOST/$cell/.cell" ] || die "no cell called '$cell' (make cells)"
+uid=$(sed -n 's/^uid=\([0-9]*\)$/\1/p' "$CELLS_HOST/$cell/.cell")
+[ -n "$uid" ] || die "no uid in $CELLS_HOST/$cell/.cell"
 
-# Paths as you see them in the box -> where they are on the host.
+# A path as you see it in the box -> where it is on the host: the longest
+# container mount that contains it. Host paths pass through unchanged.
 host_path() {
-  case $1 in
-    /data|/data/*)         echo "$SRV/data${1#/data}" ;;
-    /home/dev|/home/dev/*) echo "$SRV/home${1#/home/dev}" ;;
-    *)                     echo "$1" ;;
-  esac
+  local p=$1 best="" bsrc="" src dst
+  while read -r src dst; do
+    [ -n "$dst" ] || continue
+    case $p/ in "$dst"/*) [ ${#dst} -gt ${#best} ] && best=$dst bsrc=$src ;; esac
+  done <<<"$MOUNTS"
+  if [ -n "$best" ] && [ "$best" != / ]; then echo "$bsrc${p#"$best"}"; else echo "$p"; fi
 }
 # /etc/fstab spells spaces, tabs and backslashes as octal escapes.
 fstab_escape() { local s=${1//\\/\\134}; s=${s// /\\040}; printf '%s' "${s//$'\t'/\\011}"; }
@@ -63,9 +76,13 @@ share)
   [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "name: letters, digits, '.', '_' and '-' only (set AS=...)"
   rw=${5:-0}
   case $src/ in
-    /|"$SRV"/|"$SRV/home"/|"$SRV/data"/|"$SRV/cells"/*|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/var/lib/docker/*)
+    /|"$CELLS_HOST"/*|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/var/lib/docker/*)
       die "won't share $src: pick a smaller folder" ;;
   esac
+  # A whole volume of the box (your home, all of /data) is too much: pick a folder in it.
+  while read -r m _; do
+    [ "$src" != "$(realpath -m -- "$m")" ] || die "won't share $src, a whole volume of the box: pick a folder inside it"
+  done <<<"$MOUNTS"
   for s in .ssh .env .t3 .claude .codex .config/gh .gnupg .netrc .aws .kube; do
     [ ! -e "$src/$s" ] || die "$src holds $s (secrets): share a subfolder instead"
   done
@@ -74,7 +91,7 @@ share)
   its code the next time YOU run git or the project's scripts there. Share it read-only, or give
   the agent its own copy (inside the box: cell $cell import <path>). FORCE=1 overrides."
   fi
-  dst=$SRV/cells/$cell/shared/$name
+  dst=$CELLS_HOST/$cell/shared/$name
   ! mountpoint -q "$dst" || die "$name is already shared with $cell"
   grep -qF " $(fstab_escape "$dst") " /etc/fstab && die "$name is in /etc/fstab already: make cell-unshare CELL=$cell DIR=$name"
   # The agent's uid gets read (or read-write) access to the folder's own files.
@@ -98,7 +115,7 @@ share)
 unshare)
   name=${3:?usage: host-share unshare <cell> <name>}
   name=$(basename "$name")
-  dst=$SRV/cells/$cell/shared/$name
+  dst=$CELLS_HOST/$cell/shared/$name
   edst=$(fstab_escape "$dst")
   fsrc=$(awk -v d="$edst" '$2 == d { print $1 }' /etc/fstab | head -1)
   if mountpoint -q "$dst"; then umount "$dst"; fi

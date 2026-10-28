@@ -1,10 +1,23 @@
 # shellcheck shell=bash
 # Shared by the cell scripts. A cell is an isolated agent: Linux user
-# cell-<name>, everything under /cells/<name>, a uid from 2001-2999 (the
-# network guard matches that range, so keep the two in step).
+# cell-<name> (also in group "cells"), everything under /cells/<name>, a uid
+# from 2001-2999 (the network guard matches that range, so keep the two in
+# step).
 CELLS=/cells
 CELL_UID_MIN=2001
 CELL_UID_MAX=2999
+CELLS_GID=2000
+
+# Per-box settings, optional (/opt/agent-box/cells.conf, from the image):
+#   CELL_PRIVATE_DIRS  your folders: "other" permissions get taken off them,
+#                      since a cell can read anything world-readable
+#   CELL_DENY_DIRS     shared scratch folders cells may write to but not list.
+#                      /tmp is the big one: your agents leave world-readable
+#                      files there. Cells get their own TMPDIR, but tools that
+#                      insist on /tmp (an X server's lock file, say) still work.
+CELL_PRIVATE_DIRS="/home/dev /data"
+CELL_DENY_DIRS="/tmp /var/tmp"
+if [ -r /opt/agent-box/cells.conf ]; then . /opt/agent-box/cells.conf; fi
 
 cell_name_ok() { [[ ${1-} =~ ^[a-z][a-z0-9]{0,19}$ ]]; }
 

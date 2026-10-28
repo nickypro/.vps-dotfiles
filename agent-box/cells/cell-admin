@@ -21,10 +21,14 @@ die() { echo "cell-admin: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root (from the host: make cell CELL=<name>)"
 
 lock_dev_dirs() {
-  # A cell can read anything world-readable, so take "other" off the two
-  # places that hold your own files. (Group stays: it's only `dev`.)
-  chmod o-rwx /home/dev
-  [ -d /data ] && chmod o-rwx /data
+  # A cell can read anything world-readable, so take "other" off the places
+  # that hold your own files (CELL_PRIVATE_DIRS, see lib.sh). In shared
+  # scratch space like /tmp (CELL_DENY_DIRS), cells may create files but not
+  # list what's there, so yours stay out of sight. The image layer resets
+  # those ACLs on a rebuild, so this runs on every start.
+  local d
+  for d in $CELL_PRIVATE_DIRS; do [ -d "$d" ] && chmod o-rwx "$d"; done
+  for d in $CELL_DENY_DIRS; do [ -d "$d" ] && setfacl -m "g:cells:-wx" "$d"; done
   return 0
 }
 
@@ -32,10 +36,12 @@ sync_cell() {
   local name=$1 d=$CELLS/$1 u=cell-$1 uid
   uid=$(cell_uid "$name")
   [[ $uid =~ ^[0-9]+$ ]] && (( uid >= CELL_UID_MIN && uid <= CELL_UID_MAX )) || die "bad uid in $d/.cell"
+  getent group cells >/dev/null || groupadd -g "$CELLS_GID" cells
   getent group "$u" >/dev/null || groupadd -g "$uid" "$u"
   # -M: the home already exists (or is created below). No password, so the
   # account is locked: only sudo from dev (T3, `cell`) runs anything as it.
-  getent passwd "$u" >/dev/null || useradd -u "$uid" -g "$uid" -d "$d/home" -M -s /bin/bash -c "isolated agent $name" "$u"
+  getent passwd "$u" >/dev/null || useradd -u "$uid" -g "$uid" -G cells -d "$d/home" -M -s /bin/bash -c "isolated agent $name" "$u"
+  id -nG "$u" | grep -qw cells || usermod -aG cells "$u"
   chown root:root "$CELLS" "$d" && chmod 711 "$CELLS" "$d"
   install -d -m 700 -o "$u" -g "$u" "$d/home" "$d/work" "$d/tmp"
   install -d -m 755 -o root -g root "$d/shared"   # make cell-share mounts land here
@@ -136,7 +142,7 @@ if action == "add":
                           "homePath": f"/cells/{name}/home/.claude"}}
     pi[xid] = {"driver": "codex", "displayName": f"Cell {name} Codex", "accentColor": "#b45309",
                "enabled": True,
-               "config": {"setupMode": "existing", "binaryPath": f"/opt/agent-box/cell-bin/codex-{name}",
+               "config": {"binaryPath": f"/opt/agent-box/cell-bin/codex-{name}",
                           "homePath": f"/cells/{name}/home/.codex"}}
 else:
     pi.pop(cid, None)
@@ -178,7 +184,7 @@ cmd_add() {
   cat <<EOF
   cell '$name' is ready: user cell-$name (uid $uid), work folder $d/work
   In T3 it appears as the providers "Cell $name" (Claude) and "Cell $name Codex".
-  Next, inside the box (ssh agent-box):
+  Next, inside the box (logged in as dev):
     cell $name claude auth login        # its own Claude login (or put ANTHROPIC_API_KEY in its ~/.env)
     cell $name codex login --device-auth
   Then in T3: add the project $d/work and pick "Cell $name" for its threads.
