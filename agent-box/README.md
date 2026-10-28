@@ -85,6 +85,10 @@ make pair                  # T3 pairing link
   `...` menu). Otherwise it drops off your tailnet when its key expires.
 - Use `tailscale serve`, never `tailscale funnel`: Funnel publishes to the
   whole internet. `make doctor` warns if it's on.
+- "Your tailnet only" means everyone on it. If other people are on your
+  tailnet (a team, or a device someone shared with you), add a rule to the
+  tailnet's access policy (admin console, Access controls) so only you can
+  reach this machine.
 
 **mtls** (needs nginx and certbot). Set `ACCESS = mtls` and `DOMAIN` in
 `config.mk`, and your domain in `nginx/agent-box-mtls.conf`, then:
@@ -97,6 +101,15 @@ sudo make web-passwd USER_ARG=me      # optional password for devices without a 
 sudo make host-config                 # link nginx + fail2ban config, reload
 make pair                             # T3 pairing link
 ```
+
+Lost a device, or done with a cert? `sudo make cert-revoke NAME_ARG=laptop`
+and nginx refuses it from then on (`make client-cert-list` shows which are
+revoked). Each name gets one cert, so a replacement needs a new name, like
+`laptop-2`.
+
+If a device says the `.p12` password is wrong when it isn't, it may not read
+OpenSSL 3's newer encryption: export it again with `openssl pkcs12 -export
+-legacy ...`, using the same `.key` and `.crt`.
 
 **public** (needs nginx and certbot). Set `ACCESS = public` and `DOMAIN` in
 `config.mk`, and your domain in `nginx/agent-box-public.conf`, then:
@@ -131,10 +144,28 @@ Host agent-box
   User dev
   HostKeyAlias agent-box
   ProxyJump myvps
+  ForwardAgent no
 ```
 
 `HostKeyAlias` stops the container's key being filed as `[127.0.0.1]:2222`,
 which collides with anything else you reach on that port.
+
+`ForwardAgent no` matters if you have `ForwardAgent yes` anywhere else: every
+agent has sudo in the box, so any of them could use a forwarded agent to log
+in as you wherever your keys work. The container's sshd refuses forwarding
+too, but this keeps your client from offering it. (For GitHub, use `gh auth
+login` inside the box instead.)
+
+The box only reads keys from `./authorized_keys` on the host, never from
+`~/.ssh/authorized_keys` inside it, so an agent can't add a key of its own,
+and deleting a line really does revoke that key.
+
+### The T3 desktop and phone apps
+
+The desktop app can connect over SSH: add `agent-box` as an SSH host and it
+picks up the T3 server already running in tmux, so the web UI, the desktop
+app and your phone all see the same threads. On a phone, open the pairing
+link from `make pair LABEL=phone` (over your tailnet, in tailscale mode).
 
 ### Closing public SSH (tailscale mode, optional)
 
@@ -162,14 +193,17 @@ don't need Tailscale SSH for this.)
 make help          # list everything
 make status        # container + t3 + web access + fail2ban
 make doctor        # verify the things that have broken before
-make rebuild       # rebuild image, recreate container
+make update        # latest claude, codex and t3, in place, then restart T3
+make rebuild       # fresh base image + latest CLIs, recreate the container
 make t3-restart    # restart T3 without dropping SSH sessions
-make cert NAME_ARG=phone   # mtls: client cert for a new device
+make pair LABEL=phone           # T3 pairing link for one more device
+make cert NAME_ARG=phone        # mtls: client cert for a new device
+make cert-revoke NAME_ARG=phone # mtls: refuse that cert from now on
 ```
 
-Updating the agent CLIs without a rebuild:
-`sudo npm i -g @anthropic-ai/claude-code@latest @openai/codex@latest t3@latest`,
-then `make t3-restart`.
+`make update` is quick but lives in the container's own layer, which a
+recreate throws away. `make rebuild` re-downloads the base image (security
+fixes) and the CLIs (at most once a day), so it never rolls you back.
 
 ## Backups (Kopia to Backblaze B2)
 
@@ -258,9 +292,10 @@ make backup-now      # first run now; it can take hours
 **The repository password is the only way to decrypt the backups.** Put it in
 your password manager now. `b2.env` itself is not backed up.
 
-### Alerts (optional)
+### Alerts (optional, but do it)
 
-Make a check at [healthchecks.io](https://healthchecks.io) with a 1 hour
+The 14-day lock only helps if you notice a problem within 14 days, and a
+backup that quietly stopped looks exactly like one that works. Make a check at [healthchecks.io](https://healthchecks.io) with a 1 hour
 period (grace: a few hours, for the first long upload) and put its ping URL
 in `b2.env` as `HC_URL`. The script pings it when it starts and when it ends,
 so a missed or failed backup, a nearly full disk or a failed read-back sends
@@ -322,7 +357,8 @@ from using the box as a step towards anything else:
   80/443; the cloud metadata service at 169.254.169.254 (which on some clouds
   hands out credentials); private ranges 10/8, 172.16/12, 192.168/16; and
   Tailscale's 100.64/10, so in tailscale mode agents can't reach your other
-  devices.
+  devices. The IPv6 equivalents (fc00::/7, fe80::/10) too, in case you ever
+  turn IPv6 on for the docker network.
 - **Unaffected:** traffic the host starts (SSH jump, `tailscale serve`/nginx to
   T3, docker's port publishing). Replies match "established".
 - It's its own nftables table (`inet agent_box_guard`), so ufw and docker never
@@ -338,6 +374,11 @@ make net-test          # from inside the container: what's open, what's blocked
 sudo make guard-off    # lift it until the next boot or `make up`
 ```
 
+If `make net-test` says DNS is BROKEN, your provider's DNS server is in one
+of the blocked ranges (some clouds put it at 169.254.169.253 or in 10/8):
+add `dns: [1.1.1.1, 9.9.9.9]` to the service in `docker-compose.yml` and
+`make up`.
+
 The container is also capped at 4096 processes (`pids_limit`), so a runaway
 agent can't exhaust the host's process table.
 
@@ -345,6 +386,17 @@ agent can't exhaust the host's process table.
 
 Don't put API keys in `~/.zshrc`; it ends up in backups and screenshares. Put
 them in `~/.env` (mode 0600, `KEY=value` lines). The seeded `.zshrc` loads it.
+
+Everything in the box, `~/.env` and the agents' own logins included, is
+readable by every agent, and an agent can be talked into things by a web page
+it reads. So hand them credentials you'd be fine losing:
+
+- **GitHub:** a [fine-grained token](https://github.com/settings/personal-access-tokens)
+  for just the repos the agents work on (`gh auth login --with-token`),
+  rather than the all-repos login `gh auth login` gives you by default.
+- **API keys:** a separate key for the box, with a spending limit set in the
+  provider's dashboard.
+- **Nothing else:** no cloud admin keys, no SSH keys to other machines.
 
 ## Things that bit us (don't undo these)
 
@@ -371,6 +423,12 @@ them in `~/.env` (mode 0600, `KEY=value` lines). The seeded `.zshrc` loads it.
 - **fail2ban `mode = normal` is pinned on purpose.** Normal mode ignores
   failed *publickey* attempts, so offering several keys never bans you;
   `aggressive` mode counts them.
+- **sshd reads only the host's `authorized_keys`, and refuses agent
+  forwarding.** See "Client SSH config". If you used to keep keys in the
+  box's `~/.ssh/authorized_keys`, move them to `./authorized_keys`.
+- **`make build` uses `--pull` and a date stamp.** Without them, Docker
+  reuses months-old layers: an unpatched base image, and CLIs older than the
+  ones `make update` installed.
 - **No Docker socket in the container.** An agent that can reach dockerd is
   effectively root on the host.
 - **Keep exactly one copy of the CA key** (mtls). Two copies with separate

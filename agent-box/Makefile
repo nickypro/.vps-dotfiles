@@ -26,9 +26,9 @@ ifeq ($(ACCESS),tailscale)
 endif
 DOMAIN ?= code.example.com
 
-.PHONY: help build up down restart rebuild logs shell t3-logs t3-restart pair \
+.PHONY: help build up down restart rebuild update logs shell t3-logs t3-restart pair \
         host-config host-config-tailscale host-config-mtls host-config-public fail2ban-config \
-        ca cert client-cert-list web-passwd \
+        ca cert cert-revoke client-cert-list web-passwd \
         backup-link backup-status backup-now \
         guard-link guard-off net-test \
         status status-tailscale status-mtls status-public ps \
@@ -39,8 +39,10 @@ help:  ## Show this help
 > @echo "  ACCESS=$(ACCESS) (config.mk)"
 
 ## --- container ----------------------------------------------------------
-build:  ## Build the image
-> $(COMPOSE) build
+build:  ## Build the image (fresh base image, today's agent CLIs)
+> @# --pull picks up the base image's security fixes; the date re-runs the
+> @# npm layer at most once a day, so the CLIs are current too.
+> $(COMPOSE) build --pull --build-arg AGENTS_STAMP=$$(date +%F)
 
 up:  ## Start (or recreate) the container
 > @test -f authorized_keys || { echo "create ./authorized_keys first (see authorized_keys.example)"; exit 1; }
@@ -56,6 +58,15 @@ restart:  ## Restart the container
 > $(COMPOSE) restart
 
 rebuild: build up  ## Rebuild the image and recreate the container
+
+update:  ## Update claude, codex and t3 in place (no rebuild), then restart T3
+> @# Same --allow-scripts as the Dockerfile: without it npm skips node-pty's
+> @# build and T3's terminals stop working.
+> docker exec $(NAME) npm install -g --allow-scripts=msgpackr-extract,node-pty \
+   @anthropic-ai/claude-code@latest @openai/codex@latest t3@latest
+> docker exec $(NAME) node -e "require('/usr/local/lib/node_modules/t3/node_modules/node-pty')"
+> @docker exec $(NAME) sh -lc 'echo "  claude $$(claude --version)"; echo "  codex  $$(codex --version)"; echo "  t3     $$(t3 --version)"'
+> @$(MAKE) --no-print-directory t3-restart
 
 logs:  ## Follow container logs (sshd)
 > docker logs -f --tail 100 $(NAME)
@@ -74,9 +85,9 @@ t3-restart:  ## Restart just T3, without dropping SSH sessions
 > docker exec -d $(NAME) su dev -s /bin/sh -c 'tmux new-session -d -s t3 "t3 serve --mode web --host 0.0.0.0 --port 3773 --no-browser --auto-bootstrap-project-from-cwd /home/dev 2>&1 | tee -a /home/dev/.t3-serve.log"'
 > @sleep 3 && curl -sf -o /dev/null -w "  t3 http: %{http_code}\n" http://127.0.0.1:3773/ || echo "  t3 not responding yet"
 
-pair:  ## Mint a T3 pairing token for the web UI (30 min)
+pair:  ## Mint a T3 pairing token for the web UI (30 min):  make pair LABEL=phone
 > @test -n "$(DOMAIN)" || { echo "  no DOMAIN: is tailscale up and jq installed? Or set DOMAIN in config.mk"; exit 1; }
-> @docker exec $(NAME) su dev -s /bin/sh -c 't3 auth pairing create --ttl 30m --label laptop --base-url https://$(DOMAIN)' | grep -aE 'Token:|Pair URL:|Expires' || true
+> @docker exec $(NAME) su dev -s /bin/sh -c 't3 auth pairing create --ttl 30m --label $(or $(LABEL),laptop) --base-url https://$(DOMAIN)' | grep -aE 'Token:|Pair URL:|Expires' || true
 
 ## --- web access: host side (ACCESS in config.mk) ------------------------
 host-config: host-config-$(ACCESS) fail2ban-config  ## Set up web access for ACCESS, plus fail2ban
@@ -84,6 +95,8 @@ host-config: host-config-$(ACCESS) fail2ban-config  ## Set up web access for ACC
 # Each mode removes the other modes' pieces (after its own checks pass), so
 # switching is just "edit config.mk, run sudo make host-config again".
 UNLINK_NGINX := rm -f /etc/nginx/sites-enabled/agent-box*.conf /etc/fail2ban/jail.d/agent-box-nginx.local
+# An empty client-cert revocation list (mtls), included by nginx.
+NEW_REVOKED_MAP := printf '%s\n' '\# Revoked client-cert serials, one per line: <SERIAL> 1;' '\# Appended by: make cert-revoke NAME_ARG=<device>' > $(AUTHDIR)/revoked.map
 
 host-config-tailscale:
 > @tailscale status >/dev/null 2>&1 || { echo "  tailscale is not up: sudo tailscale up"; exit 1; }
@@ -100,6 +113,9 @@ host-config-mtls host-config-public: host-config-%:
 > @grep -q "server_name $(DOMAIN);" nginx/agent-box-$*.conf || { echo "  put $(DOMAIN) in nginx/agent-box-$*.conf first (server_name and cert paths)"; exit 1; }
 > @test -f /etc/letsencrypt/live/$(DOMAIN)/fullchain.pem || { echo "  no TLS cert yet: sudo certbot certonly --nginx -d $(DOMAIN)"; exit 1; }
 > @test $* != mtls   || test -f $(AUTHDIR)/ca.crt   || { echo "  no client CA yet: sudo make ca"; exit 1; }
+> @# nginx refuses to start if the revocation list it includes is missing
+> @# (e.g. a CA made before cert-revoke existed).
+> @test $* != mtls   || test -f $(AUTHDIR)/revoked.map || $(NEW_REVOKED_MAP)
 > @test $* != public || test -f $(AUTHDIR)/htpasswd || { echo "  public mode needs a password first: sudo make web-passwd USER_ARG=me"; exit 1; }
 > $(UNLINK_NGINX)
 > ln -sfn $(CURDIR)/nginx/agent-box-$*.conf /etc/nginx/sites-enabled/agent-box-$*.conf
@@ -121,11 +137,15 @@ ca:  ## mtls: create the private CA for client certs (once)
 > mkdir -p $(AUTHDIR) && cd $(AUTHDIR) && umask 077 && \
    openssl req -x509 -newkey rsa:4096 -nodes -keyout ca.key -out ca.crt \
      -days 3650 -subj "/CN=agent-box client CA" 2>/dev/null && chmod 644 ca.crt
+> @$(NEW_REVOKED_MAP)
 > @echo "  CA written to $(AUTHDIR) - keep exactly one copy of ca.key"
 
 cert:  ## mtls: issue a client cert for a device:  make cert NAME_ARG=firefox
 > @test "$(ACCESS)" = mtls || { echo "  client certs are for ACCESS=mtls (config.mk has $(ACCESS))"; exit 1; }
 > @test -n "$(NAME_ARG)" || { echo "usage: make cert NAME_ARG=<device>"; exit 1; }
+> @# Reissuing under the same name would overwrite the old .crt, and with it
+> @# the only record of the serial that cert-revoke needs.
+> @test ! -e $(AUTHDIR)/$(NAME_ARG).crt || { echo "  $(NAME_ARG) already has a cert: pick a new name (e.g. $(NAME_ARG)-2), or cert-revoke the old one first"; exit 1; }
 > @cd $(AUTHDIR) && umask 077 && \
    PASS=$$(openssl rand -base64 18 | tr -d '/+=' | head -c 20) && \
    openssl genrsa -out $(NAME_ARG).key 2048 2>/dev/null && \
@@ -138,8 +158,22 @@ cert:  ## mtls: issue a client cert for a device:  make cert NAME_ARG=firefox
    echo "  wrote $(AUTHDIR)/$(NAME_ARG).p12   password: $$PASS" && \
    echo "  copy it off, then: rm $(AUTHDIR)/$(NAME_ARG).p12 $(AUTHDIR)/$(NAME_ARG).key"
 
-client-cert-list:  ## mtls: list issued client certs
-> @ls -1 $(AUTHDIR)/*.crt 2>/dev/null | grep -v ca.crt | sed 's|.*/|  |;s|\.crt$$||' || echo "  none"
+cert-revoke:  ## mtls: revoke a device's client cert:  make cert-revoke NAME_ARG=phone
+> @test "$(ACCESS)" = mtls || { echo "  client certs are for ACCESS=mtls (config.mk has $(ACCESS))"; exit 1; }
+> @test -n "$(NAME_ARG)" || { echo "usage: make cert-revoke NAME_ARG=<device>   (names: make client-cert-list)"; exit 1; }
+> @test -f $(AUTHDIR)/$(NAME_ARG).crt || { echo "  no cert named $(NAME_ARG) (make client-cert-list)"; exit 1; }
+> @# The .crt stays, so the name keeps pointing at its (now revoked) serial.
+> @S=$$(openssl x509 -in $(AUTHDIR)/$(NAME_ARG).crt -noout -serial | cut -d= -f2) && \
+   if grep -q "^$$S " $(AUTHDIR)/revoked.map 2>/dev/null; then echo "  $(NAME_ARG) was already revoked"; \
+   else echo "$$S 1;  # $(NAME_ARG), revoked $$(date -u +%F)" >> $(AUTHDIR)/revoked.map && \
+        nginx -t 2>/dev/null && systemctl reload nginx && echo "  revoked $(NAME_ARG) (serial $$S): nginx now answers it with 403"; fi
+
+client-cert-list:  ## mtls: list issued client certs and which are revoked
+> @for c in $(AUTHDIR)/*.crt; do n=$$(basename "$$c" .crt); [ "$$n" = ca ] || [ ! -e "$$c" ] && continue; \
+   S=$$(openssl x509 -in "$$c" -noout -serial | cut -d= -f2); \
+   if grep -q "^$$S " $(AUTHDIR)/revoked.map 2>/dev/null; then st=REVOKED; \
+   else st="valid until $$(openssl x509 -in "$$c" -noout -enddate | cut -d= -f2)"; fi; \
+   printf "  %-16s %s\n" "$$n" "$$st"; done
 
 web-passwd:  ## mtls/public: set the web password:  make web-passwd USER_ARG=me
 > @test "$(ACCESS)" != tailscale || { echo "  no web password in tailscale mode: your tailnet is the lock"; exit 1; }

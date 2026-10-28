@@ -47,17 +47,25 @@ COPY skel.zshrc /etc/skel-zsh/.zshrc
 
 # The three agent CLIs. --allow-scripts is required or npm 11 silently skips
 # node-pty's native build, which T3 needs for terminals.
+# `make build` passes today's date as AGENTS_STAMP, so a rebuild fetches the
+# latest CLIs instead of reusing a cached layer from months ago (which would
+# also quietly undo any `make update` done since).
+ARG AGENTS_STAMP=0
 RUN npm install -g --allow-scripts=msgpackr-extract,node-pty \
       @anthropic-ai/claude-code @openai/codex t3 \
  && npm cache clean --force \
  && node -e "require('/usr/local/lib/node_modules/t3/node_modules/node-pty')" \
  && echo "node-pty native build OK"
 
-# sshd. Keys come from a host-managed file mounted at
+# sshd. Keys come ONLY from a host-managed file mounted read-only at
 # /etc/ssh/authorized_keys.d/dev, so access is rotated without touching the
-# volume or rebuilding. UsePAM yes is REQUIRED: the dev account has no
-# password (locked, "!" in shadow) and OpenSSH rejects locked accounts as
-# "invalid user" when PAM is off.
+# volume or rebuilding. ~/.ssh/authorized_keys is deliberately not read: an
+# agent could write its own key there, and deleting a key from the host file
+# would no longer be the whole story.
+# No agent forwarding: anything with sudo in here (every agent) could use a
+# forwarded agent socket to log in as you wherever your keys work.
+# UsePAM yes is REQUIRED: the dev account has no password (locked, "!" in
+# shadow) and OpenSSH rejects locked accounts as "invalid user" when PAM is off.
 RUN mkdir -p /etc/ssh/authorized_keys.d /run/sshd \
  && printf '%s\n' \
       'Port 2222' \
@@ -70,7 +78,8 @@ RUN mkdir -p /etc/ssh/authorized_keys.d /run/sshd \
       'UsePAM yes' \
       'PermitRootLogin no' \
       'AllowUsers dev' \
-      'AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u .ssh/authorized_keys' \
+      'AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u' \
+      'AllowAgentForwarding no' \
       'X11Forwarding no' \
       'PrintMotd no' \
       'AcceptEnv LANG LC_*' \
