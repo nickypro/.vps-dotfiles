@@ -17,6 +17,7 @@ endif
 
 COMPOSE := docker compose
 NAME    := agent-box
+SRV     := /srv/agent-box
 AUTHDIR := /etc/nginx/agent-box
 
 # The web UI's hostname. Tailscale mode looks up this machine's MagicDNS name
@@ -26,7 +27,8 @@ ifeq ($(ACCESS),tailscale)
 endif
 DOMAIN ?= code.example.com
 
-.PHONY: help build up down restart rebuild update logs shell t3-logs t3-restart pair \
+.PHONY: help build up down restart rebuild update logs shell t3-logs t3-restart pair secret \
+        cell cells cell-share cell-unshare cell-rm \
         host-config host-config-tailscale host-config-mtls host-config-public fail2ban-config \
         ca cert cert-revoke client-cert-list web-passwd \
         backup-link backup-status backup-now \
@@ -42,11 +44,12 @@ help:  ## Show this help
 build:  ## Build the image (fresh base image, today's agent CLIs)
 > @# --pull picks up the base image's security fixes; the date re-runs the
 > @# npm layer at most once a day, so the CLIs are current too.
-> $(COMPOSE) build --pull --build-arg AGENTS_STAMP=$$(date +%F)
+> $(COMPOSE) build --pull --build-arg AGENTS_STAMP=$$(date +%F) --build-arg EXTRAS="$(EXTRAS)"
 
 up:  ## Start (or recreate) the container
 > @test -f authorized_keys || { echo "create ./authorized_keys first (see authorized_keys.example)"; exit 1; }
 > mkdir -p ssh_host_keys
+> @test -d $(SRV)/cells || mkdir -p $(SRV)/cells || { echo "  create $(SRV)/cells first: sudo mkdir $(SRV)/cells"; exit 1; }
 > $(COMPOSE) up -d
 > @# compose may have recreated the network (new bridge name), so re-aim the guard.
 > @systemctl restart agent-box-guard 2>/dev/null && echo "  network guard re-applied" || echo "  network guard NOT re-applied: sudo systemctl restart agent-box-guard (first time: sudo make guard-link)"
@@ -60,12 +63,12 @@ restart:  ## Restart the container
 rebuild: build up  ## Rebuild the image and recreate the container
 
 update:  ## Update claude, codex and t3 in place (no rebuild), then restart T3
-> @# Same --allow-scripts as the Dockerfile: without it npm skips node-pty's
-> @# build and T3's terminals stop working.
-> docker exec $(NAME) npm install -g --allow-scripts=msgpackr-extract,node-pty \
+> @# Same --allow-scripts as the Dockerfile: npm 11 skips install scripts
+> @# otherwise, and Claude Code's sets up its native binary.
+> docker exec $(NAME) npm install -g --allow-scripts=@anthropic-ai/claude-code,msgpackr-extract,node-pty \
    @anthropic-ai/claude-code@latest @openai/codex@latest t3@latest
-> docker exec $(NAME) node -e "require('/usr/local/lib/node_modules/t3/node_modules/node-pty')"
-> @docker exec $(NAME) sh -lc 'echo "  claude $$(claude --version)"; echo "  codex  $$(codex --version)"; echo "  t3     $$(t3 --version)"'
+> @# As dev: the first run of a new t3 downloads its binary into ~/.t3/runtime.
+> @docker exec -u dev -e HOME=/home/dev $(NAME) sh -c 'echo "  claude $$(claude --version)"; echo "  codex  $$(codex --version)"; echo "  t3     $$(t3 --version)"'
 > @$(MAKE) --no-print-directory t3-restart
 
 logs:  ## Follow container logs (sshd)
@@ -81,13 +84,44 @@ t3-logs:  ## Tail the T3 server log
 t3-restart:  ## Restart just T3, without dropping SSH sessions
 > docker exec $(NAME) su dev -s /bin/sh -c 'tmux kill-session -t t3 2>/dev/null; true'
 > @# Killing tmux can leave the old server orphaned and holding the port.
-> -docker exec $(NAME) pkill -u dev -f "t3 serve"
-> docker exec -d $(NAME) su dev -s /bin/sh -c 'tmux new-session -d -s t3 "t3 serve --mode web --host 0.0.0.0 --port 3773 --no-browser --auto-bootstrap-project-from-cwd /home/dev 2>&1 | tee -a /home/dev/.t3-serve.log"'
+> -docker exec -u dev $(NAME) pkill -f "t3 serve"
+> docker exec -d $(NAME) su dev -s /bin/sh -c 'tmux new-session -d -s t3 "/opt/agent-box/bin/t3-serve 2>&1 | tee -a /home/dev/.t3-serve.log"'
 > @sleep 3 && curl -sf -o /dev/null -w "  t3 http: %{http_code}\n" http://127.0.0.1:3773/ || echo "  t3 not responding yet"
 
 pair:  ## Mint a T3 pairing token for the web UI (30 min):  make pair LABEL=phone
 > @test -n "$(DOMAIN)" || { echo "  no DOMAIN: is tailscale up and jq installed? Or set DOMAIN in config.mk"; exit 1; }
 > @docker exec $(NAME) su dev -s /bin/sh -c 't3 auth pairing create --ttl 30m --label $(or $(LABEL),laptop) --base-url https://$(DOMAIN)' | grep -aE 'Token:|Pair URL:|Expires' || true
+
+secret:  ## Save an API key for the agents (asks for it, hidden):  make secret KEY=OPENAI_API_KEY [CELL=web]
+> @test -n "$(KEY)" || { echo "usage: make secret KEY=<NAME> [CELL=<cell>]"; exit 1; }
+> @read -rsp "  value for $(KEY) (not shown): " v && echo && \
+   docker exec -i $(NAME) /opt/agent-box/bin/set-secret "$(KEY)" $(CELL) <<< "$$v"
+> @test -n "$(CELL)" || echo "  make t3-restart, so agents T3 starts see it too"
+
+## --- isolated agents ("cells"; see README) -----------------------------
+cell:  ## New isolated agent: own user + folder, own providers in T3:  make cell CELL=web
+> @test -n "$(CELL)" || { echo "usage: make cell CELL=<name>"; exit 1; }
+> docker exec -u root $(NAME) /opt/agent-box/cells/cell-admin add $(CELL)
+
+cells:  ## List isolated agents, their logins and shared folders
+> @docker exec -u root $(NAME) /opt/agent-box/cells/cell-admin list
+
+# AS= names the share. make has a built-in AS (the assembler, "as"), so only
+# take it when you set it yourself.
+SHARE_AS = $(if $(filter command line environment,$(origin AS)),$(AS))
+cell-share:  ## Show it a folder, read-only unless RW=1:  sudo make cell-share CELL=web DIR=/data/papers
+> @test -n "$(CELL)" -a -n "$(DIR)" || { echo "usage: sudo make cell-share CELL=<cell> DIR=<folder> [AS=<name>] [RW=1]"; exit 1; }
+> $(CURDIR)/cells/host-share share $(CELL) "$(DIR)" "$(SHARE_AS)" "$(or $(RW),0)"
+> @docker exec $(NAME) test -d /cells/$(CELL)/shared/$(or $(SHARE_AS),$(notdir $(patsubst %/,%,$(DIR)))) \
+   && echo "  visible in the box now" || echo "  not visible inside yet: make up (the /cells volume needs propagation: rslave)"
+
+cell-unshare:  ## Stop sharing a folder with it:  sudo make cell-unshare CELL=web DIR=papers
+> @test -n "$(CELL)" -a -n "$(DIR)" || { echo "usage: sudo make cell-unshare CELL=<cell> DIR=<name>"; exit 1; }
+> $(CURDIR)/cells/host-share unshare $(CELL) "$(DIR)"
+
+cell-rm:  ## Remove its user and T3 providers (its files stay):  make cell-rm CELL=web
+> @test -n "$(CELL)" || { echo "usage: make cell-rm CELL=<name>"; exit 1; }
+> docker exec -u root $(NAME) /opt/agent-box/cells/cell-admin rm $(CELL)
 
 ## --- web access: host side (ACCESS in config.mk) ------------------------
 host-config: host-config-$(ACCESS) fail2ban-config  ## Set up web access for ACCESS, plus fail2ban
@@ -209,12 +243,17 @@ guard-link:  ## Install the nftables guard that keeps the container off the host
 > systemctl link $(CURDIR)/firewall/agent-box-guard.service
 > systemctl daemon-reload && systemctl enable agent-box-guard && systemctl restart agent-box-guard
 
-guard-off:  ## Lift the guard until the next boot or `make up` (for debugging)
+guard-off:  ## Lift the guard until the next boot or `make up` (isolated agents then refuse to start)
 > systemctl stop agent-box-guard
+> /usr/local/sbin/agent-box-guard off
 
 net-test:  ## Show what the container can reach (run after any firewall change)
 > @docker cp $(CURDIR)/firewall/net-probe.sh $(NAME):/tmp/net-probe.sh
-> @docker exec -u dev $(NAME) bash /tmp/net-probe.sh "$$(ip -4 route get 1.1.1.1 | grep -o 'src [0-9.]*' | cut -d' ' -f2)"; docker exec $(NAME) rm -f /tmp/net-probe.sh
+> @P=$$(ip -4 route get 1.1.1.1 | grep -o 'src [0-9.]*' | cut -d' ' -f2); \
+   echo "as dev:"; docker exec -u dev $(NAME) bash /tmp/net-probe.sh "$$P"; \
+   C=$$(docker exec $(NAME) sh -c 'ls /cells/*/.cell 2>/dev/null | head -1 | cut -d/ -f3'); \
+   if [ -n "$$C" ]; then echo "as the isolated agent $$C:"; docker exec $(NAME) sudo -u cell-$$C bash /tmp/net-probe.sh "$$P" cell; fi; \
+   docker exec $(NAME) rm -f /tmp/net-probe.sh
 
 ## --- checks -------------------------------------------------------------
 status: ps  ## Show container, web access and fail2ban status
@@ -235,18 +274,21 @@ ps:  ## Container process state
 > @docker ps --filter name=$(NAME) --format "  {{.Names}} | {{.Status}} | {{.Ports}}"
 
 doctor:  ## Verify the things that have broken before
-> @echo "checking node-pty native build..."
-> @docker exec $(NAME) node -e "require('/usr/local/lib/node_modules/t3/node_modules/node-pty');console.log('  node-pty OK')"
 > @echo "checking CLIs..."
-> @docker exec $(NAME) sh -lc 'echo "  claude $$(claude --version)"; echo "  codex  $$(codex --version)"; echo "  t3     $$(t3 --version)"'
+> @docker exec -u dev -e HOME=/home/dev $(NAME) sh -c 'echo "  claude $$(claude --version)"; echo "  codex  $$(codex --version)"; echo "  t3     $$(t3 --version)"'
+> @echo "checking T3's terminals (node-pty in its runtime)..."
+> @docker exec -u dev $(NAME) sh -c 'v=$$(t3 --version | grep -o "[0-9]*\.[0-9.]*" | head -1); test -d /home/dev/.t3/runtime/versions/$$v/node_modules/node-pty' \
+   && echo "  node-pty OK" || echo "  WARNING: no node-pty in T3's runtime - make t3-restart, then check make t3-logs"
 > @echo "checking mounts..."
 > @docker exec $(NAME) sh -c 'for d in /home/dev /data; do printf "  %-10s %s\n" $$d "$$(mountpoint -q $$d && echo mounted || echo NOT-MOUNTED)"; done'
 > @echo "checking T3 is reachable through the port publish (not bound to 127.0.0.1)..."
-> @docker exec $(NAME) ps -eo args | grep -q -- "t3 serve.*--host 0.0.0.0" && echo "  t3 bound to 0.0.0.0 OK" || echo "  WARNING: t3 not on 0.0.0.0 - the web UI will 502"
+> @docker exec -u dev $(NAME) ps -eo args | grep -q -- "t3 serve.*--host 0.0.0.0" && echo "  t3 bound to 0.0.0.0 OK" || echo "  WARNING: t3 not on 0.0.0.0 - the web UI will 502"
 > @echo "checking host key persistence..."
 > @ls $(CURDIR)/ssh_host_keys/ssh_host_ed25519_key >/dev/null 2>&1 && echo "  host keys persisted OK" || echo "  WARNING: host keys not persisted"
 > @echo "checking network guard..."
 > @B=br-$$(docker network inspect -f '{{.Id}}' $(NAME)_default | cut -c1-12); nft list table inet agent_box_guard 2>/dev/null | grep -q "\"$$B\"" && echo "  guard active on $$B" || echo "  WARNING: guard missing or aimed at an old bridge (sudo make guard-link)"
+> @P=$$(docker inspect -f '{{.State.Pid}}' $(NAME)); nsenter -t $$P -n nft list table inet agent_box_cells >/dev/null 2>&1 \
+   && echo "  isolated agents' table active" || echo "  WARNING: isolated agents' table missing (sudo systemctl restart agent-box-guard; or this needs root)"
 > @echo "checking web access (ACCESS=$(ACCESS))..."
 > @$(MAKE) --no-print-directory doctor-$(ACCESS)
 

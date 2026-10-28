@@ -1,0 +1,3 @@
+#!/bin/bash
+# Wine opens web links (the Dreamtonics log-in) with this: the desktop's browser.
+exec /opt/agent-box/extras/desktop/desktop browser "$@" >/dev/null

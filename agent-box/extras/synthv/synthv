@@ -1,0 +1,12 @@
+#!/bin/bash
+# Start Synthesizer V Studio 2 Pro on the agent-box desktop (starting the
+# desktop too if needed). Also the handler for the dreamtonics-svstudio2://
+# log-in callback, passed through as "$1".
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+. "$HERE/env.sh"
+[ -f "$WINEPREFIX/drive_c/Program Files/Synthesizer V Studio 2 Pro/synthv-studio.exe" ] || {
+  echo "synthv: not installed yet: /opt/agent-box/extras/synthv/setup" >&2; exit 69; }
+/opt/agent-box/extras/desktop/desktop start >/dev/null
+cd "$WINEPREFIX/drive_c" || exit 1
+setsid wine "$SYNTHV_EXE" "$@" >>"$SV/synthv.log" 2>&1 </dev/null &
+echo "Synthesizer V is starting on the desktop (log: $SV/synthv.log)"

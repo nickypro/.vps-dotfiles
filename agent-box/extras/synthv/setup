@@ -1,0 +1,114 @@
+#!/bin/bash
+# Synthesizer V Studio 2 Pro (Windows build) under Wine, on the agent-box
+# desktop. Synthesizer V 2 has no Linux version and no way to render without
+# its window, so this is the only way to run it on a server. Needs
+# EXTRAS="desktop wine" (config.mk), then make rebuild.
+#
+#   /opt/agent-box/extras/synthv/setup    install (safe to re-run)
+#   synthv                                 start the app on the desktop
+#
+# Follows the community recipe in github.com/mito551/synthv2-linux: Kron4ek's
+# Wine staging-tkg, the WebView2 92.0.902.73 fixed runtime, Windows 7 mode so
+# the app's WebView2 panels (log-in, voice manager, settings) draw. Tested
+# with 2.2.1 on Debian 12 (Oct 2026), including the Dreamtonics log-in and a
+# Kasane Teto AI 2 trial playing through the desktop's sound.
+#
+# Everything lives in ~/.local/share/synthv (Wine, its prefix, the app), so
+# it survives rebuilds. Your Dreamtonics licence covers one device at a time:
+# logging in here moves it off your own computer.
+set -euo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+command -v cabextract >/dev/null || { echo "setup: add 'wine' (and 'desktop') to EXTRAS in config.mk, then make rebuild" >&2; exit 69; }
+. "$HERE/env.sh"
+WINE_VER=11.19
+WINE_DIR=wine-$WINE_VER-staging-tkg-amd64-wow64   # WoW64 build: no 32-bit system libraries needed
+WV_VER=92.0.902.73
+WV_DIR=141.0.3537.71   # like the Bottles recipe: the 92 files sit under a current Evergreen version
+SV_VER=${SYNTHV_VERSION:-2.2.1}
+# The link the account's Download button gives for 2.2.1. The "latest" URL on
+# download.dreamtonics.com still served 2.1.2 in Oct 2026. For a newer one,
+# copy its link from your account: SYNTHV_URL=... SYNTHV_VERSION=... setup
+SV_URL=${SYNTHV_URL:-https://authr3-media.r2.dreamtonics.com/updates/Synthesizer-V-Studio-2-Pro/svstudio2-pro-setup-2.2.1_2.2.1_131585_6nDskUCuqusxJtzK.exe}
+APP="$WINEPREFIX/drive_c/Program Files/Synthesizer V Studio 2 Pro/synthv-studio.exe"
+
+mkdir -p "$SV/dl" && chmod 700 "$SV"
+if [ ! -x "$SV/$WINE_DIR/bin/wine" ]; then
+  echo "downloading Wine $WINE_VER"
+  curl -fsSL -o "$SV/dl/$WINE_DIR.tar.xz" \
+    "https://github.com/Kron4ek/Wine-Builds/releases/download/$WINE_VER/$WINE_DIR.tar.xz"
+  tar -xf "$SV/dl/$WINE_DIR.tar.xz" -C "$SV" && rm -f "$SV/dl/$WINE_DIR.tar.xz"
+fi
+ln -sfn "$WINE_DIR" "$SV/wine"
+
+desktop start >/dev/null            # the installers need a display
+[ -f "$WINEPREFIX/system.reg" ] || { echo "creating the Wine prefix"; wineboot -i >/dev/null 2>&1; }
+
+WV="$WINEPREFIX/drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application"
+if [ ! -f "$WV/$WV_DIR/msedgewebview2.exe" ]; then
+  echo "installing WebView2 $WV_VER (as $WV_DIR)"
+  cab="$SV/dl/Microsoft.WebView2.FixedVersionRuntime.$WV_VER.x64.cab"
+  [ -s "$cab" ] || curl -fsSL -o "$cab" \
+    "https://github.com/westinyang/WebView2RuntimeArchive/releases/download/$WV_VER/${cab##*/}"
+  rm -rf "$SV/dl/wv" && cabextract -q -d "$SV/dl/wv" "$cab"
+  mkdir -p "$WV" && rm -rf "${WV:?}/$WV_DIR" "${WV:?}/$WV_VER"
+  mv "$SV/dl/wv/Microsoft.WebView2.FixedVersionRuntime.$WV_VER.x64" "$WV/$WV_DIR" && rm -rf "$SV/dl/wv"
+fi
+# Register it the way the Evergreen installer would, so the app finds it.
+cat >"$SV/dl/webview2.reg" <<EOF
+REGEDIT4
+
+[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}]
+"pv"="$WV_DIR"
+"name"="Microsoft Edge WebView2 Runtime"
+"location"="C:\\\\Program Files (x86)\\\\Microsoft\\\\EdgeWebView\\\\Application"
+
+[HKEY_LOCAL_MACHINE\\SOFTWARE\\Wow6432Node\\Microsoft\\EdgeUpdate\\ClientState\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}]
+"EBWebView"="C:\\\\Program Files (x86)\\\\Microsoft\\\\EdgeWebView\\\\Application\\\\$WV_DIR"
+EOF
+wine regedit /S "$SV/dl/webview2.reg"
+
+installed=$(wine reg query 'HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\SynthesizerVStudio2Pro_is1' \
+  /v DisplayVersion 2>/dev/null | tr -d '\r' | awk '/DisplayVersion/ {print $3}' || true)
+if [ ! -f "$APP" ] || [ "$installed" != "$SV_VER" ]; then
+  echo "installing Synthesizer V Studio 2 Pro $SV_VER (was: ${installed:-none})"
+  inst="$SV/dl/${SV_URL##*/}"
+  [ -s "$inst" ] || curl -fsSL -o "$inst" "$SV_URL"
+  dl="$WINEPREFIX/drive_c/users/$USER/Downloads"
+  mkdir -p "$dl" && cp "$inst" "$dl/"
+  wineserver -k || true
+  # The 2.2.1 installer refuses Windows 7 mode, so install in 10 and switch back.
+  wine reg add 'HKCU\Software\Wine' /v Version /d win10 /f >/dev/null 2>&1
+  wine "C:\\users\\$USER\\Downloads\\${SV_URL##*/}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- >/dev/null 2>&1
+  sleep 5
+  wineserver -k || true             # the installer starts the app; we start it ourselves
+  rm -f "$dl/${SV_URL##*/}"
+fi
+wine reg add 'HKCU\Software\Wine' /v Version /d win7 /f >/dev/null 2>&1
+
+# The Dreamtonics log-in ends by opening dreamtonics-svstudio2://..., which has
+# to reach the app (see bin/xdg-open for why Debian needs help with that).
+mkdir -p "$XDG_DATA_HOME/applications"
+cat >"$XDG_DATA_HOME/applications/synthv-url-handler.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Synthesizer V Studio 2 (log-in handler)
+Exec=$HERE/synthv %u
+MimeType=x-scheme-handler/dreamtonics-svstudio2;
+NoDisplay=true
+EOF
+xdg-mime default synthv-url-handler.desktop x-scheme-handler/dreamtonics-svstudio2
+ln -sfn "$HERE/synthv" "$SV/synthv"     # the desktop's menu looks for this
+desktop start >/dev/null                # rewrites the menu with the app in it
+
+cat <<EOF
+
+Synthesizer V Studio 2 Pro $SV_VER is installed. Start it with: synthv
+(or right-click the desktop). The first time:
+  1. Log In opens the browser on the desktop. Log in; when it asks to open the
+     link with the app, allow it. If the dialog then keeps spinning, press Escape:
+     under Wine it doesn't close itself. Later starts are logged in already.
+  2. Cloud icon (right edge) -> Trial Products, or My Products -> your voices,
+     e.g. Kasane Teto AI 2. Trial voices can't export audio; you hear them
+     through the desktop's sound.
+$(desktop status | tail -4)
+EOF

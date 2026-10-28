@@ -1,0 +1,24 @@
+#!/bin/bash
+# Your own claude and codex (as /opt/agent-box/bin/claude and .../codex):
+# they refuse to start inside an isolated agent's folder.
+#
+# An agent reads its project's settings at start-up, and Claude's can run
+# shell commands (hooks). Started as you in a folder an isolated agent can
+# write, that would run the agent's commands with your rights. T3 points
+# your providers here (cell-admin add does that) and your shells find these
+# first on PATH. Isolated agents themselves start the real binaries.
+tool=${0##*/}
+if [ "$EUID" = 1000 ]; then
+  case ${1-} in
+    --version|-v|-V) ;;
+    *)
+      here=$(pwd -P 2>/dev/null)
+      case $here in
+        /cells/*)
+          n=${here#/cells/}; n=${n%%/*}
+          echo "$tool: this folder belongs to the isolated agent '$n'. In T3, pick its provider (\"Cell $n\"); in a shell, run: cell $n $tool" >&2
+          exit 64 ;;
+      esac ;;
+  esac
+fi
+exec "/usr/local/bin/$tool" "$@"

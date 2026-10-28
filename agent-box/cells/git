@@ -1,0 +1,78 @@
+#!/bin/bash
+# agent-box git shim: installed as /usr/local/bin/git, ahead of /usr/bin/git.
+#
+# Inside an isolated agent's folder (/cells/<name>), git runs as that cell's
+# user rather than as you. A repo the agent can write can carry settings
+# that make git run programs (core.fsmonitor, hooks, filters, ...), and T3
+# runs git there constantly for diffs and checkpoints; as you, that would let
+# the agent run code with your rights. As the cell, it changes nothing.
+#
+# Everyone else, and every other folder, gets /usr/bin/git untouched. If
+# this shim is ever skipped, git's own ownership check refuses the cell's
+# repos ("detected dubious ownership"), so it fails safe -- as long as you
+# never add /cells to your safe.directory.
+real=/usr/bin/git
+[ "$EUID" = 1000 ] || exec "$real" "$@"
+. /opt/agent-box/cells/lib.sh
+
+base=$(pwd -P 2>/dev/null || echo /)
+cell=
+pick() {
+  local c
+  c=$(cell_of "$1" "$base")
+  [ -n "$c" ] || return 0
+  if [ -n "$cell" ] && [ "$cell" != "$c" ]; then
+    echo "git: refusing a command that spans two isolated agents ($cell, $c)" >&2
+    exit 128
+  fi
+  cell=$c
+}
+pick "$base"
+for v in "${GIT_DIR-}" "${GIT_WORK_TREE-}" "${GIT_COMMON_DIR-}"; do
+  if [ -n "$v" ]; then pick "$v"; fi
+done
+# Options before the subcommand can point git elsewhere.
+i=1
+while [ "$i" -le $# ]; do
+  a=${!i}
+  case $a in
+    -C) i=$((i + 1)); d=${!i-.}; [[ $d == /* ]] || d=$base/$d; base=$(realpath -m -- "$d"); pick "$base" ;;
+    --git-dir=*|--work-tree=*) pick "${a#*=}" ;;
+    --git-dir|--work-tree) i=$((i + 1)); pick "${!i-.}" ;;
+    -c|--namespace|--config-env|--super-prefix) i=$((i + 1)) ;;
+    -*) ;;
+    *) break ;;
+  esac
+  i=$((i + 1))
+done
+[ -n "$cell" ] || exec "$real" "$@"
+
+user=cell-$cell
+keep=()
+while IFS= read -r v; do
+  case $v in
+    GIT_*|LANG|LC_*|TZ|TERM|NO_COLOR|COLUMNS) keep+=("$v") ;;
+  esac
+done < <(compgen -e)
+as_cell() {
+  local pe=()
+  if [ ${#keep[@]} -gt 0 ]; then pe=(--preserve-env="$(IFS=,; echo "${keep[*]}")"); fi
+  sudo -n -u "$user" "${pe[@]}" -- /opt/agent-box/cells/cell-exec "$real" "$@"
+}
+
+# T3 builds commits and reviews in a temporary index (GIT_INDEX_FILE) of its
+# own, outside the repo, where the cell can't reach. Give the cell a copy in
+# its tmp folder and bring the result back.
+if [ -n "${GIT_INDEX_FILE-}" ] && [ -z "$(cell_of "$GIT_INDEX_FILE" "$base")" ]; then
+  outer=$GIT_INDEX_FILE
+  t=$(mktemp -d -p "$CELLS/$cell/tmp" git-index.XXXXXX) || exit 128
+  trap 'rm -rf -- "$t"' EXIT
+  chmod 770 "$t"            # lets the ACL give the cell its rights in here
+  if [ -f "$outer" ]; then cat -- "$outer" >"$t/index"; fi
+  export GIT_INDEX_FILE=$t/index
+  as_cell "$@"
+  rc=$?
+  if [ -f "$t/index" ]; then cat -- "$t/index" >"$outer"; fi
+  exit $rc
+fi
+as_cell "$@"

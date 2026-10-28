@@ -1,0 +1,12 @@
+#!/bin/sh
+# Starts the T3 server (the entrypoint and `make t3-restart` run this as dev).
+#  - /opt/agent-box/bin first on PATH: the claude/codex guards for isolated
+#    agents (cells/agent-guard).
+#  - ~/.env loaded, so the agents T3 starts get your API keys, not only your
+#    shells. Change ~/.env, then `make t3-restart`. Isolated agents don't
+#    inherit these: they have their own ~/.env.
+export PATH="/opt/agent-box/bin:$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+if [ -r "$HOME/.env" ]; then set -a; . "$HOME/.env"; set +a; fi
+cd "$HOME" || exit 1
+exec t3 serve --mode web --host 0.0.0.0 --port 3773 --no-browser \
+  --auto-bootstrap-project-from-cwd "$HOME" "$@"

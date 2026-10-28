@@ -29,10 +29,15 @@ if [ ! -f /home/dev/.zshrc ]; then
   echo "entrypoint: seeded /home/dev/.zshrc"
 fi
 
+# --- isolated agents ----------------------------------------------------
+# Their users live in the image layer, which a rebuild replaces: recreate
+# them from /cells/*/.cell (on the host volume) before anything can start one.
+/opt/agent-box/cells/cell-admin sync || echo "entrypoint: warning - cell-admin sync failed" >&2
+
 # --- services ------------------------------------------------------------
 # T3 runs in a tmux session; sshd is PID 1. A T3 crash or restart therefore
-# never drops your SSH sessions.
-su dev -s /bin/sh -c 'tmux has-session -t t3 2>/dev/null || tmux new-session -d -s t3 "t3 serve --mode web --host 0.0.0.0 --port 3773 --no-browser --auto-bootstrap-project-from-cwd /home/dev 2>&1 | tee -a /home/dev/.t3-serve.log"' \
+# never drops your SSH sessions. t3-serve loads ~/.env and the PATH T3 needs.
+su dev -s /bin/sh -c 'tmux has-session -t t3 2>/dev/null || tmux new-session -d -s t3 "/opt/agent-box/bin/t3-serve 2>&1 | tee -a /home/dev/.t3-serve.log"' \
   || echo "entrypoint: warning - could not start the t3 tmux session" >&2
 
 exec /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config_box

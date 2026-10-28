@@ -1,0 +1,235 @@
+#!/bin/bash
+# Isolated agents ("cells"), container side. Runs as root in the container:
+# the host's `make cell*` targets call it through docker exec, and the
+# entrypoint runs `cell-admin sync` on every start to recreate the users
+# (they live in the image layer, their files on the host under /cells).
+#
+#   cell-admin add <name>     new cell, plus its two providers in T3
+#   cell-admin rm <name>      remove the user and its T3 providers (files stay)
+#   cell-admin list           cells, their logins and shared folders
+#   cell-admin sync           recreate users and wrappers (entrypoint)
+#
+# What a cell is: a Linux user (cell-<name>, no sudo) whose home and work
+# folder are /cells/<name>/home and /cells/<name>/work. The kernel stops it
+# reading /home/dev, /data, other cells or anything else not world-readable,
+# and the network guard stops it reaching anything listening in the container
+# (T3's own API included). T3 runs it through cell-run, as the "binary path"
+# of the providers this script adds.
+set -euo pipefail
+. /opt/agent-box/cells/lib.sh
+die() { echo "cell-admin: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run as root (from the host: make cell CELL=<name>)"
+
+lock_dev_dirs() {
+  # A cell can read anything world-readable, so take "other" off the two
+  # places that hold your own files. (Group stays: it's only `dev`.)
+  chmod o-rwx /home/dev
+  [ -d /data ] && chmod o-rwx /data
+  return 0
+}
+
+sync_cell() {
+  local name=$1 d=$CELLS/$1 u=cell-$1 uid
+  uid=$(cell_uid "$name")
+  [[ $uid =~ ^[0-9]+$ ]] && (( uid >= CELL_UID_MIN && uid <= CELL_UID_MAX )) || die "bad uid in $d/.cell"
+  getent group "$u" >/dev/null || groupadd -g "$uid" "$u"
+  # -M: the home already exists (or is created below). No password, so the
+  # account is locked: only sudo from dev (T3, `cell`) runs anything as it.
+  getent passwd "$u" >/dev/null || useradd -u "$uid" -g "$uid" -d "$d/home" -M -s /bin/bash -c "isolated agent $name" "$u"
+  chown root:root "$CELLS" "$d" && chmod 711 "$CELLS" "$d"
+  install -d -m 700 -o "$u" -g "$u" "$d/home" "$d/work" "$d/tmp"
+  install -d -m 755 -o root -g root "$d/shared"   # make cell-share mounts land here
+  # dev (you, and T3) may look in, never change anything: T3 reads the work
+  # folder for diffs, and its git runs as the cell anyway (see the git shim).
+  # The default ACL applies to new files whatever the agent's umask is.
+  setfacl -m u:dev:rx "$d/home"
+  setfacl -m u:dev:rx -m d:u:dev:rX "$d/work"
+  # The git shim swaps T3's temporary index files through here.
+  setfacl -m u:dev:rwx -m d:u:dev:rwX -m d:u:"$u":rwX "$d/tmp"
+  install -d -m 755 /opt/agent-box/cell-bin
+  ln -sfn /opt/agent-box/cells/cell-run "/opt/agent-box/cell-bin/claude-$name"
+  ln -sfn /opt/agent-box/cells/cell-run "/opt/agent-box/cell-bin/codex-$name"
+}
+
+seed_home() {
+  # Starter files. Only missing ones are written, so re-adding a removed cell
+  # keeps its keys, logins and anything it changed.
+  local name=$1 h=$CELLS/$1/home u=cell-$1 gn ge t
+  t=$(mktemp -d)
+  cat >"$t/.profile" <<'EOF'
+[ -f ~/.bashrc ] && . ~/.bashrc
+EOF
+  cat >"$t/.bashrc" <<EOF
+# Isolated agent "$name". Your API keys for it go in ~/.env (KEY=value lines).
+export PATH=\$HOME/.local/bin:\$PATH
+PS1='\[\e[1;33m\](cell $name)\[\e[0m\] \w \$ '
+alias ll='ls -alh'
+EOF
+  # Commits made in the cell carry your name, like your own.
+  gn=$(runuser -u dev -- env HOME=/home/dev git config --global user.name 2>/dev/null || true)
+  ge=$(runuser -u dev -- env HOME=/home/dev git config --global user.email 2>/dev/null || true)
+  : >"$t/.gitconfig"
+  git config -f "$t/.gitconfig" user.name "${gn:-cell $name}"
+  git config -f "$t/.gitconfig" user.email "${ge:-cell-$name@agent-box}"
+  git config -f "$t/.gitconfig" init.defaultBranch main
+  : >"$t/.env"
+  # Both agents read these instructions in every session.
+  cat >"$t/CLAUDE.md" <<EOF
+# You are an isolated agent
+
+You run as the Linux user \`cell-$name\`, with no sudo. You can only see
+/cells/$name (your work folder, your home, and shared/) plus world-readable
+system files. That's on purpose; don't try to get around it.
+
+- Work in /cells/$name/work.
+- Folders the owner shared with you are in /cells/$name/shared/ (read-only
+  unless they told you otherwise).
+- Local servers: use ports 20000-29999 (e.g. \`npm run dev -- --port 20000\`).
+  Every other port on this machine is blocked for you, so a server you start
+  on 3000 or 8080 can't be reached, even by you.
+- Your API keys, if any, are environment variables from ~/.env.
+EOF
+  install -d -m 700 -o "$u" -g "$u" "$h/.claude" "$h/.codex"
+  local f dst
+  for f in .profile .bashrc .gitconfig .env CLAUDE.md:.claude/CLAUDE.md CLAUDE.md:.codex/AGENTS.md; do
+    dst=${f#*:}; f=${f%%:*}
+    [ -e "$h/$dst" ] || install -m "$([ "$f" = .env ] && echo 600 || echo 644)" -o "$u" -g "$u" "$t/$f" "$h/$dst"
+  done
+  rm -rf "$t"
+}
+
+# Add or remove the cell's providers in T3's settings (T3 reloads the file
+# by itself). Also points your own claude/codex providers at the guards in
+# /opt/agent-box/bin, which refuse to start inside a cell's folder.
+t3_settings() {
+  runuser -u dev -- env HOME=/home/dev python3 - "$@" <<'PY'
+import json, os, sys, tempfile
+action, name = sys.argv[1], sys.argv[2]
+path = os.path.expanduser("~/.t3/userdata/settings.json")
+try:
+    with open(path) as f:
+        d = json.load(f)
+    mode = os.stat(path).st_mode & 0o777
+except FileNotFoundError:
+    d, mode = {}, 0o600
+pi = d.setdefault("providerInstances", {})
+cid, xid = f"cell-{name}-claude", f"cell-{name}-codex"
+if action == "add":
+    guard = {"claudeAgent": "/opt/agent-box/bin/claude", "codex": "/opt/agent-box/bin/codex"}
+    plain = {"claudeAgent": ("", "claude", "/usr/local/bin/claude"),
+             "codex": ("", "codex", "/usr/local/bin/codex")}
+    pi.setdefault("claudeAgent", {"driver": "claudeAgent"})
+    pi.setdefault("codex", {"driver": "codex"})
+    for iid, inst in pi.items():
+        drv = inst.get("driver")
+        if drv not in guard or iid.startswith("cell-"):
+            continue
+        cfg = inst.setdefault("config", {})
+        if drv == "codex" and cfg.get("setupMode") == "managed":
+            print(f"  note: T3 manages its own codex for '{iid}', so the guard can't apply to it")
+        elif cfg.get("binaryPath", "") in plain[drv]:
+            cfg["binaryPath"] = guard[drv]
+            print(f"  your provider '{iid}' now starts through {guard[drv]}")
+    pi[cid] = {"driver": "claudeAgent", "displayName": f"Cell {name}", "accentColor": "#b45309",
+               "enabled": True,
+               "config": {"binaryPath": f"/opt/agent-box/cell-bin/claude-{name}",
+                          "homePath": f"/cells/{name}/home/.claude"}}
+    pi[xid] = {"driver": "codex", "displayName": f"Cell {name} Codex", "accentColor": "#b45309",
+               "enabled": True,
+               "config": {"setupMode": "existing", "binaryPath": f"/opt/agent-box/cell-bin/codex-{name}",
+                          "homePath": f"/cells/{name}/home/.codex"}}
+else:
+    pi.pop(cid, None)
+    pi.pop(xid, None)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, mode)
+os.replace(tmp, path)
+PY
+}
+
+cmd_add() {
+  local name=${1-} d uid
+  cell_name_ok "$name" || die "name: lowercase letters and digits, starting with a letter, at most 20 (got '${name}')"
+  d=$CELLS/$name
+  [ ! -e "$d/.cell" ] || die "cell '$name' already exists"
+  getent passwd "cell-$name" >/dev/null && die "a user cell-$name already exists"
+  mountpoint -q "$CELLS" || die "$CELLS is not mounted: add the /cells volume (docker-compose.yml) and make up"
+  # A cell removed earlier under this name gets its old uid back, so its old
+  # files still belong to it. Otherwise: the first free uid.
+  uid=$(sed -n 's/^uid=\([0-9]*\)$/\1/p' "$d"/.cell-removed-* 2>/dev/null | head -1 || true)
+  if [ -z "$uid" ] || getent passwd "$uid" >/dev/null || grep -qsx "uid=$uid" "$CELLS"/*/.cell; then
+    uid=$CELL_UID_MIN
+    while grep -qsx "uid=$uid" "$CELLS"/*/.cell || getent passwd "$uid" >/dev/null || getent group "$uid" >/dev/null; do
+      uid=$((uid + 1))
+    done
+  fi
+  (( uid <= CELL_UID_MAX )) || die "no free uid left in $CELL_UID_MIN-$CELL_UID_MAX"
+  install -d -m 711 -o root -g root "$CELLS" "$d"
+  printf 'uid=%s\ncreated=%s\n' "$uid" "$(date -u +%F)" >"$d/.cell"
+  chmod 644 "$d/.cell"
+  sync_cell "$name"
+  seed_home "$name"
+  lock_dev_dirs
+  t3_settings add "$name"
+  cat <<EOF
+  cell '$name' is ready: user cell-$name (uid $uid), work folder $d/work
+  In T3 it appears as the providers "Cell $name" (Claude) and "Cell $name Codex".
+  Next, inside the box (ssh agent-box):
+    cell $name claude auth login        # its own Claude login (or put ANTHROPIC_API_KEY in its ~/.env)
+    cell $name codex login --device-auth
+  Then in T3: add the project $d/work and pick "Cell $name" for its threads.
+EOF
+}
+
+cmd_rm() {
+  local name=${1-}
+  cell_exists "$name" || die "no cell called '$name'"
+  if findmnt -rn -o TARGET | grep -q "^$CELLS/$name/shared/"; then
+    die "unshare its folders first (on the host: make cell-unshare CELL=$name DIR=...)"
+  fi
+  pkill -u "cell-$name" 2>/dev/null || true
+  t3_settings rm "$name"
+  userdel "cell-$name" 2>/dev/null || true
+  getent group "cell-$name" >/dev/null && groupdel "cell-$name"
+  rm -f "/opt/agent-box/cell-bin/claude-$name" "/opt/agent-box/cell-bin/codex-$name"
+  mv "$CELLS/$name/.cell" "$CELLS/$name/.cell-removed-$(date -u +%F)"
+  echo "  removed cell '$name' (user and T3 providers). Its files are still in $CELLS/$name."
+}
+
+cmd_list() {
+  local f name h shares
+  printf '  %-12s %-6s %-8s %-8s %s\n' CELL UID CLAUDE CODEX SHARED
+  for f in "$CELLS"/*/.cell; do
+    [ -e "$f" ] || { echo "  (no cells yet: make cell CELL=<name> on the host)"; return 0; }
+    name=${f%/.cell}; name=${name##*/}; h=$CELLS/$name/home
+    shares=$(findmnt -rn -o TARGET,OPTIONS | awk -v p="$CELLS/$name/shared/" \
+      'index($1, p) == 1 { n = substr($1, length(p) + 1); printf "%s%s(%s) ", s, n, ($2 ~ /(^|,)ro(,|$)/ ? "ro" : "rw") }')
+    # "login": its own subscription login; "key": a key in its ~/.env
+    printf '  %-12s %-6s %-8s %-8s %s\n' "$name" "$(cell_uid "$name")" \
+      "$(if [ -s "$h/.claude/.credentials.json" ]; then echo login; elif grep -qsE '^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=' "$h/.env"; then echo key; else echo -; fi)" \
+      "$(if grep -qs '"auth_mode": *"chatgpt"' "$h/.codex/auth.json"; then echo login; elif [ -s "$h/.codex/auth.json" ] || grep -qs '^OPENAI_API_KEY=' "$h/.env"; then echo key; else echo -; fi)" \
+      "${shares:--}"
+  done
+}
+
+cmd_sync() {
+  local f n=0
+  [ -d "$CELLS" ] || return 0
+  for f in "$CELLS"/*/.cell; do
+    [ -e "$f" ] || continue
+    f=${f%/.cell}; sync_cell "${f##*/}"; n=$((n + 1))
+  done
+  if (( n > 0 )); then lock_dev_dirs; echo "cell-admin: $n cell(s) ready"; fi
+}
+
+case ${1-} in
+  add)  cmd_add "${2-}" ;;
+  rm)   cmd_rm "${2-}" ;;
+  list) cmd_list ;;
+  sync) cmd_sync ;;
+  *)    sed -n '7,10p' "$0" >&2; exit 64 ;;
+esac

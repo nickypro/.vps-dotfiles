@@ -15,3 +15,10 @@ ACCESS = tailscale
 # paths) in nginx/agent-box-$(ACCESS).conf. In tailscale mode leave it unset:
 # the box's MagicDNS name (myvps.your-tailnet.ts.net) is looked up for you.
 # DOMAIN = code.example.com
+
+# Optional extras baked into the image (space-separated; then make rebuild):
+#   desktop   a private remote desktop in your browser, with sound, and
+#             Chromium on it that agents can drive (README: Extras)
+#   wine      libraries Windows apps need under Wine (Synthesizer V); with desktop
+#   scraping  curl_cffi, trafilatura, yt-dlp, Camoufox, Playwright... in /opt/scrape
+EXTRAS =

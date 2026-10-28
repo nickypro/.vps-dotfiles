@@ -1,0 +1,163 @@
+#!/bin/bash
+# A private remote desktop you open in your own browser, with live sound.
+# Needs EXTRAS=desktop (config.mk), then make rebuild.
+#
+#   desktop start          start it if needed, print the link
+#   desktop browser [url]  Chromium on the desktop. Agents drive it through
+#                          its debugging port (printed), and you watch.
+#   desktop status
+#   desktop stop           frees the memory (Chromium alone is ~1 GB)
+#   eval "$(desktop env)"  point a shell (or a script) at the desktop, so the
+#                          programs it starts show up there
+#
+# Works for you and for an isolated agent (cell web desktop start): each gets
+# its own display, ports and state folder.
+#
+# Privacy: Xvnc and the sound stream are Unix sockets in a 0700 folder, and the
+# X display needs a private cookie. The only network port is websockify (the
+# noVNC page) on 127.0.0.1, and it only connects people who have the two
+# random tokens in the link. Reach it with an SSH tunnel.
+set -euo pipefail
+command -v Xvnc >/dev/null || { echo "desktop: not installed. Add 'desktop' to EXTRAS in config.mk, then make rebuild" >&2; exit 69; }
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+
+# You get display :7, the page on 6080 and Chromium's debugging port on 9222.
+# An isolated agent (uid 2001-2999) gets ports in its own 20000-29999 range,
+# the only local ports the network guard lets it use.
+uid=$(id -u)
+if (( uid >= 2001 && uid <= 2999 )); then
+  base=$(( 20000 + (uid - 2000) * 10 ))
+  N=${DESKTOP_DISPLAY:-$(( 20 + uid - 2000 ))} PORT=${DESKTOP_PORT:-$((base + 8))} CDP=${DESKTOP_CDP_PORT:-$((base + 9))}
+else
+  N=${DESKTOP_DISPLAY:-7} PORT=${DESKTOP_PORT:-6080} CDP=${DESKTOP_CDP_PORT:-9222}
+fi
+STATE=${DESKTOP_HOME:-$HOME/.local/share/agent-box-desktop}
+RUN=$STATE/run
+export DISPLAY=:$N XAUTHORITY=$RUN/Xauthority
+export PULSE_SERVER=unix:$RUN/pulse/native PULSE_RUNTIME_PATH=$RUN/pulse
+export XDG_CONFIG_HOME=$STATE/config XDG_DATA_HOME=$STATE/share XDG_CACHE_HOME=$STATE/cache
+
+running() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
+bg() {  # bg NAME CMD... : start CMD detached, unless NAME already runs
+  local name=$1; shift
+  running "$name" && return 0
+  setsid "$@" >"$RUN/$name.log" 2>&1 </dev/null &
+  echo $! >"$RUN/$name.pid"
+}
+link() {
+  local v a
+  v=$(sed -n 1p "$RUN/tokens" | cut -d: -f1); a=$(sed -n 2p "$RUN/tokens" | cut -d: -f1)
+  cat <<EOF
+Desktop :$N is up.
+  1. On your own computer:  ssh -N -L $PORT:localhost:$PORT agent-box
+  2. Then open:             http://localhost:$PORT/desktop.html#v=$v&a=$a
+Right-click the desktop for a terminal or the browser. Click "Turn sound on" for sound.
+EOF
+}
+
+start() {
+  mkdir -p "$RUN/pulse" "$XDG_CONFIG_HOME/openbox" "$XDG_DATA_HOME/applications" "$XDG_CACHE_HOME" "$STATE/web"
+  chmod 700 "$STATE" "$RUN"
+  if ! running xvnc; then
+    rm -f "$RUN/Xauthority" "$RUN/vnc.sock"
+    touch "$RUN/Xauthority"
+    xauth -q -f "$RUN/Xauthority" add ":$N" . "$(mcookie)"
+    # -rfbport -1: no TCP listener at all (TigerVNC otherwise opens 590N on every interface)
+    bg xvnc Xvnc ":$N" -geometry "${DESKTOP_SIZE:-1600x900}" -depth 24 -auth "$RUN/Xauthority" \
+      -nolisten tcp -rfbport -1 -rfbunixpath "$RUN/vnc.sock" -rfbunixmode 0600 \
+      -SecurityTypes None -AlwaysShared -desktop "agent-box"
+    for _ in $(seq 100); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+    if awk -v p="$(printf ':%04X$' $((5900 + N)))" '$4 == "0A" && $2 ~ p {bad = 1} END {exit !bad}' /proc/net/tcp /proc/net/tcp6; then
+      echo "desktop: Xvnc is listening on TCP $((5900 + N)); refusing to continue" >&2
+      kill "$(cat "$RUN/xvnc.pid")"; exit 1
+    fi
+    xsetroot -solid '#2b2d42'
+  fi
+  # Right-click menu. Apps installed by extras (Synthesizer V) add themselves.
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<openbox_menu xmlns="http://openbox.org/3.4/menu"><menu id="root-menu" label="agent-box">'
+    echo "  <item label=\"Terminal\"><action name=\"Execute\"><command>xterm -fa Monospace -fs 11</command></action></item>"
+    echo "  <item label=\"Web browser\"><action name=\"Execute\"><command>$HERE/desktop browser</command></action></item>"
+    [ -x "$HOME/.local/share/synthv/synthv" ] && \
+      echo "  <item label=\"Synthesizer V Studio 2\"><action name=\"Execute\"><command>$HOME/.local/share/synthv/synthv</command></action></item>"
+    echo '</menu></openbox_menu>'
+  } >"$XDG_CONFIG_HOME/openbox/menu.xml"
+  bg openbox openbox --sm-disable
+  bg vncconfig vncconfig -nowin           # keeps the VNC clipboard in sync with X
+
+  if ! running pulse; then
+    rm -f "$RUN/pulse/native"
+    bg pulse pulseaudio -n --daemonize=no --exit-idle-time=-1 --log-target=stderr \
+      --load="module-native-protocol-unix socket=$RUN/pulse/native auth-anonymous=1" \
+      --load="module-null-sink sink_name=desktop rate=48000 channels=2 sink_properties=device.description=agent-box"
+    for _ in $(seq 50); do pactl info >/dev/null 2>&1 && break; sleep 0.1; done
+  fi
+  # Each listening browser tab gets its own parec: raw 48 kHz stereo from the sink.
+  bg audio socat UNIX-LISTEN:"$RUN/audio.sock",fork,mode=600,unlink-early \
+    EXEC:"parec --raw -d desktop.monitor --format=s16le --rate=48000 --channels=2 --latency-msec=20"
+
+  if [ ! -s "$RUN/tokens" ]; then
+    tok() { python3 -c 'import secrets; print(secrets.token_urlsafe(24))'; }
+    printf '%s: unix_socket:%s\n%s: unix_socket:%s\n' "$(tok)" "$RUN/vnc.sock" "$(tok)" "$RUN/audio.sock" >"$RUN/tokens"
+    chmod 600 "$RUN/tokens"
+  fi
+  # Links opened from apps on the desktop open in its browser.
+  cat >"$XDG_DATA_HOME/applications/agent-box-browser.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Web browser (agent-box desktop)
+Exec=$HERE/desktop browser %u
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;
+NoDisplay=true
+EOF
+  for t in x-scheme-handler/http x-scheme-handler/https text/html; do
+    xdg-mime default agent-box-browser.desktop "$t" 2>/dev/null || true
+  done
+  for f in /usr/share/novnc/*; do ln -sfn "$f" "$STATE/web/"; done
+  ln -sfn "$HERE/desktop.html" "$STATE/web/desktop.html"
+  bg websockify websockify --web "$STATE/web" --token-plugin TokenFile --token-source "$RUN/tokens" "127.0.0.1:$PORT"
+  sleep 0.5
+  for p in xvnc openbox pulse audio websockify; do
+    running "$p" || { echo "desktop: $p failed:" >&2; tail -5 "$RUN/$p.log" >&2; exit 1; }
+  done
+  link
+}
+
+browser() {
+  running xvnc || start >/dev/null
+  # No sandbox: the container has no user namespaces, so Chromium's own
+  # sandbox can't start. The debugging port is on 127.0.0.1 only; isolated
+  # agents can't reach yours (the guard blocks it).
+  if ! running chromium; then
+    bg chromium chromium --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check \
+      --password-store=basic --user-data-dir="$STATE/chromium" \
+      --remote-debugging-address=127.0.0.1 --remote-debugging-port="$CDP" "$@"
+    for _ in $(seq 50); do curl -sf "http://127.0.0.1:$CDP/json/version" >/dev/null && break; sleep 0.2; done
+  elif [ $# -gt 0 ]; then
+    chromium --user-data-dir="$STATE/chromium" "$@" >/dev/null 2>&1 &
+  fi
+  echo "Chromium is on the desktop; agents connect at http://127.0.0.1:$CDP"
+  echo "  e.g. claude mcp add browser -s user -- npx -y @playwright/mcp@latest --cdp-endpoint http://127.0.0.1:$CDP"
+}
+
+stop() {
+  pkill -u "$uid" -f "wineserver" 2>/dev/null || true
+  for p in chromium websockify audio vncconfig openbox pulse xvnc; do
+    if [ -f "$RUN/$p.pid" ]; then kill "$(cat "$RUN/$p.pid")" 2>/dev/null || true; rm -f "$RUN/$p.pid"; fi
+  done
+  pkill -u "$uid" -f "parec --raw -d desktop.monito[r]" 2>/dev/null || true
+  echo "desktop stopped"
+}
+
+case ${1:-start} in
+  start)   start ;;
+  env)     for v in DISPLAY XAUTHORITY PULSE_SERVER PULSE_RUNTIME_PATH XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME; do
+             printf 'export %s=%q\n' "$v" "${!v}"; done ;;
+  browser) shift; browser "$@" ;;
+  status)  for p in xvnc openbox pulse audio websockify chromium; do
+             printf '  %-10s %s\n' "$p" "$(running "$p" && echo running || echo -)"; done
+           running websockify && link ;;
+  stop)    stop ;;
+  *)       sed -n '5,12p' "$0" >&2; exit 64 ;;
+esac

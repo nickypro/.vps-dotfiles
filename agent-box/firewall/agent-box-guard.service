@@ -4,10 +4,12 @@ After=docker.service
 Wants=docker.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/agent-box-guard
-ExecStop=/usr/sbin/nft delete table inet agent_box_guard
+# Applies the rules, then re-applies them every time the container starts.
+# No ExecStop on purpose: if this service dies or restarts, the rules stay in
+# place rather than lifting for a moment. `make guard-off` removes them.
+ExecStart=/usr/local/sbin/agent-box-guard watch
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

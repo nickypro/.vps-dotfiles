@@ -1,0 +1,29 @@
+#!/bin/bash
+# Work as an isolated agent ("cell"), from inside the box as dev:
+#   cell                       list the cells
+#   cell <name>                a shell as that cell, in its work folder
+#   cell <name> <command...>   run one command as it, e.g.
+#                                cell web claude auth login
+#                                cell web codex login --device-auth
+#                                cell web gh auth login
+#   cell <name> import <path>  copy a file or folder of yours into its work folder
+# Make, share and remove cells from the host: make cell / cell-share / cell-rm.
+set -euo pipefail
+. /opt/agent-box/cells/lib.sh
+if [ $# -eq 0 ] || [ "$1" = list ]; then exec sudo -n /opt/agent-box/cells/cell-admin list; fi
+name=$1; shift
+cell_exists "$name" || { echo "cell: there is no cell called '$name' (make one on the host: make cell CELL=$name)" >&2; exit 64; }
+user=cell-$name
+
+if [ "${1-}" = import ]; then
+  src=${2:?usage: cell $name import <path>}
+  src=$(realpath -- "$src")
+  # You read, the cell writes: the copy belongs to the cell from the start.
+  tar -C "$(dirname "$src")" -cf - "$(basename "$src")" |
+    sudo -n -u "$user" -- /opt/agent-box/cells/cell-exec tar -C "$CELLS/$name/work" --no-same-owner -xf -
+  echo "  copied to $CELLS/$name/work/$(basename "$src")"
+  exit 0
+fi
+
+case $(pwd -P) in "$CELLS/$name"/*) ;; *) cd "$CELLS/$name/work" ;; esac
+exec sudo -n -u "$user" --preserve-env=TERM,COLORTERM,LANG -- /opt/agent-box/cells/cell-exec "$@"

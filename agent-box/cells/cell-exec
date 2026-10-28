@@ -1,0 +1,22 @@
+#!/bin/bash
+# Runs as a cell's own user, right after sudo (from cell-run, `cell` or the
+# git shim): a clean environment of its own, then the command. With no
+# command, a shell.
+set -u
+me=$(id -un)
+case $me in
+  cell-*) ;;
+  *) echo "cell-exec: only runs as a cell user, not $me" >&2; exit 64 ;;
+esac
+root=/cells/${me#cell-}
+export HOME=$root/home USER=$me LOGNAME=$me SHELL=/bin/bash
+export PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+export TMPDIR=$root/tmp
+export LANG=${LANG:-en_US.UTF-8}
+# The cell's own API keys: KEY=value lines in its ~/.env.
+if [ -r "$HOME/.env" ]; then set -a; . "$HOME/.env"; set +a; fi
+# Stay in the current folder if the cell may enter it (T3 starts it in its
+# project), otherwise begin in its work folder.
+cd "$(pwd -P 2>/dev/null || echo /nonexistent)" 2>/dev/null || cd "$root/work"
+[ $# -gt 0 ] || exec bash -l
+exec "$@"

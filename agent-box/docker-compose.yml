@@ -24,6 +24,13 @@ services:
       - ./authorized_keys:/etc/ssh/authorized_keys.d/dev:ro
       # Persist host keys so rebuilds do not change the SSH fingerprint.
       - ./ssh_host_keys:/etc/ssh/host_keys
+      # Isolated agents (make cell). rslave: folders shared with one later
+      # (make cell-share, a bind mount on the host) show up without a restart.
+      - type: bind
+        source: /srv/agent-box/cells
+        target: /cells
+        bind:
+          propagation: rslave
 
     environment:
       - TZ=Etc/UTC

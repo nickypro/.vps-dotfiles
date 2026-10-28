@@ -1,0 +1,123 @@
+#!/bin/bash
+# Show a folder to an isolated agent as /cells/<cell>/shared/<name>. Runs as
+# root on the HOST (sudo make cell-share / cell-unshare / cells).
+#
+# It's a bind mount, listed in /etc/fstab so it survives reboots. The agent
+# sees that one folder and nothing around it: the mount is checked on its own
+# path, so your home or /data stay closed even though the folder lives there.
+# Read-only unless RW=1; the kernel enforces that, not the agent.
+#
+#   host-share share   <cell> <folder> [name] [rw 0|1]
+#   host-share unshare <cell> <name or folder>
+#   host-share list
+#   host-share ro-inside   re-apply read-only inside the container (the guard
+#                          runs this whenever the container starts)
+set -euo pipefail
+SRV=/srv/agent-box
+die() { echo "  $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "run as root: sudo make ..."
+command -v setfacl >/dev/null || die "needs setfacl: sudo apt install acl"
+
+# A bind mount made read-only on the host can still arrive writable in the
+# container: the copy that propagates in is taken before the read-only step.
+# So also set it read-only from the container's side.
+fstab_unescape() { local s=${1//\\040/ }; s=${s//\\011/$'\t'}; printf '%s' "${s//\\134/\\}"; }
+ro_inside() {
+  local pid dst
+  pid=$(docker inspect -f '{{.State.Pid}}' agent-box 2>/dev/null) || return 0
+  [ "$pid" -gt 0 ] || return 0
+  awk '$4 ~ /x-agent-box-cell=/ && $4 ~ /(^|,)ro(,|$)/ { print $2 }' /etc/fstab | while read -r dst; do
+    dst=$(fstab_unescape "$dst")
+    nsenter -t "$pid" -m mount -o remount,bind,ro "/cells${dst#"$SRV/cells"}" 2>/dev/null || true
+  done
+}
+if [ "${1-}" = ro-inside ]; then ro_inside; exit 0; fi
+
+if [ "${1-}" = list ]; then
+  findmnt -rn -o SOURCE,TARGET,OPTIONS | awk -v p="$SRV/cells/" 'index($2, p) == 1 {
+    split(substr($2, length(p) + 1), a, "/"); printf "  %-10s %-16s %s %s\n", a[1], a[3], ($3 ~ /(^|,)ro(,|$)/ ? "ro" : "RW"), $1 }'
+  exit 0
+fi
+
+cmd=${1-} cell=${2-}
+[[ $cell =~ ^[a-z][a-z0-9]{0,19}$ ]] && [ -f "$SRV/cells/$cell/.cell" ] || die "no cell called '$cell' (make cells)"
+uid=$(sed -n 's/^uid=\([0-9]*\)$/\1/p' "$SRV/cells/$cell/.cell")
+[ -n "$uid" ] || die "no uid in $SRV/cells/$cell/.cell"
+
+# Paths as you see them in the box -> where they are on the host.
+host_path() {
+  case $1 in
+    /data|/data/*)         echo "$SRV/data${1#/data}" ;;
+    /home/dev|/home/dev/*) echo "$SRV/home${1#/home/dev}" ;;
+    *)                     echo "$1" ;;
+  esac
+}
+# /etc/fstab spells spaces, tabs and backslashes as octal escapes.
+fstab_escape() { local s=${1//\\/\\134}; s=${s// /\\040}; printf '%s' "${s//$'\t'/\\011}"; }
+
+case $cmd in
+share)
+  src=$(realpath -e -- "$(host_path "${3:?usage: host-share share <cell> <folder> [name] [rw]}")") || die "no such folder: $3"
+  [ -d "$src" ] || die "$src is a file: share the folder it's in"
+  name=${4:-$(basename "$src")}
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "name: letters, digits, '.', '_' and '-' only (set AS=...)"
+  rw=${5:-0}
+  case $src/ in
+    /|"$SRV"/|"$SRV/home"/|"$SRV/data"/|"$SRV/cells"/*|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/var/lib/docker/*)
+      die "won't share $src: pick a smaller folder" ;;
+  esac
+  for s in .ssh .env .t3 .claude .codex .config/gh .gnupg .netrc .aws .kube; do
+    [ ! -e "$src/$s" ] || die "$src holds $s (secrets): share a subfolder instead"
+  done
+  if [ "$rw" = 1 ] && [ "${FORCE:-0}" != 1 ] && find "$src" -maxdepth 4 -name .git -print -quit | grep -q .; then
+    die "$src holds a git repo. With write access the agent could leave settings in it that run
+  its code the next time YOU run git or the project's scripts there. Share it read-only, or give
+  the agent its own copy (inside the box: cell $cell import <path>). FORCE=1 overrides."
+  fi
+  dst=$SRV/cells/$cell/shared/$name
+  ! mountpoint -q "$dst" || die "$name is already shared with $cell"
+  grep -qF " $(fstab_escape "$dst") " /etc/fstab && die "$name is in /etc/fstab already: make cell-unshare CELL=$cell DIR=$name"
+  # The agent's uid gets read (or read-write) access to the folder's own files.
+  # The default ACL covers files added later.
+  if [ "$rw" = 1 ]; then
+    setfacl -R -m "u:$uid:rwX" "$src"
+    find "$src" -type d -exec setfacl -m "d:u:$uid:rwX,d:u:1000:rwX" {} +
+  else
+    setfacl -R -m "u:$uid:rX" "$src"
+    find "$src" -type d -exec setfacl -m "d:u:$uid:rX" {} +
+  fi
+  mkdir -p "$dst"
+  cp -a /etc/fstab "/etc/fstab.bak-agent-box"
+  printf '%s %s none bind%s,x-agent-box-cell=%s 0 0\n' \
+    "$(fstab_escape "$src")" "$(fstab_escape "$dst")" "$([ "$rw" = 1 ] || echo ,ro)" "$cell" >>/etc/fstab
+  systemctl daemon-reload 2>/dev/null || true
+  mount "$dst"
+  [ "$rw" = 1 ] || ro_inside
+  echo "  $src -> /cells/$cell/shared/$name ($([ "$rw" = 1 ] && echo READ-WRITE || echo read-only))"
+  ;;
+unshare)
+  name=${3:?usage: host-share unshare <cell> <name>}
+  name=$(basename "$name")
+  dst=$SRV/cells/$cell/shared/$name
+  edst=$(fstab_escape "$dst")
+  fsrc=$(awk -v d="$edst" '$2 == d { print $1 }' /etc/fstab | head -1)
+  if mountpoint -q "$dst"; then umount "$dst"; fi
+  src=
+  if [ -n "$fsrc" ]; then
+    cp -a /etc/fstab "/etc/fstab.bak-agent-box"
+    awk -v d="$edst" '$2 != d' /etc/fstab >/etc/fstab.agent-box.tmp
+    cat /etc/fstab.agent-box.tmp >/etc/fstab && rm -f /etc/fstab.agent-box.tmp
+    systemctl daemon-reload 2>/dev/null || true
+    src=$(fstab_unescape "$fsrc")
+  fi
+  rmdir "$dst" 2>/dev/null || true
+  if [ -n "${src:-}" ] && [ -d "$src" ]; then
+    setfacl -R -x "u:$uid" "$src" 2>/dev/null || true
+    find "$src" -type d -exec setfacl -x "d:u:$uid" {} + 2>/dev/null || true
+    echo "  unshared $name from $cell; took its access off $src"
+  else
+    echo "  unshared $name from $cell"
+  fi
+  ;;
+*) sed -n '10,12p' "$0" >&2; exit 64 ;;
+esac

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>agent-box desktop</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #2b2d42; overflow: hidden;
+               font: 13px/1.3 system-ui, sans-serif; color: #e8e8e8; }
+  iframe { border: 0; width: 100%; height: 100%; display: block; }
+  #bar { position: fixed; right: 10px; bottom: 10px; display: flex; gap: 8px; align-items: center;
+         background: rgba(20, 21, 24, .88); border: 1px solid #444; border-radius: 8px; padding: 6px 10px; }
+  #bar button { font: inherit; color: #111; background: #7ad03a; border: 0; border-radius: 5px;
+                padding: 4px 10px; cursor: pointer; font-weight: 600; }
+  #bar button.on { background: #555; color: #eee; }
+  #bar input { width: 80px; }
+  #msg { position: fixed; inset: 0; display: none; place-items: center; text-align: center; padding: 2em; }
+</style>
+</head>
+<body>
+<iframe id="vnc" title="agent-box desktop" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+<div id="bar">
+  <button id="snd">Turn sound on</button>
+  <input id="vol" type="range" min="0" max="1.5" step="0.05" value="1" title="volume">
+  <span id="st">sound off</span>
+</div>
+<div id="msg">Open the full link that <code>desktop start</code> printed; it ends in <code>#v=…&amp;a=…</code>.</div>
+<script>
+// The remote desktop is noVNC's own client in an iframe. Sound is a separate WebSocket carrying
+// raw 48 kHz stereo s16le from the desktop's PulseAudio sink, played through an AudioWorklet with
+// a small jitter buffer (~0.1 s). Nothing is recorded: it's a live monitor, like speakers.
+const hash = new URLSearchParams(location.hash.slice(1));
+const vtok = hash.get('v'), atok = hash.get('a');
+const $ = id => document.getElementById(id);
+if (!vtok || !atok) {
+  $('msg').style.display = 'grid'; $('vnc').remove(); $('bar').remove();
+} else {
+  $('vnc').src = 'vnc.html#autoconnect=1&resize=remote&reconnect=1&reconnect_delay=1000'
+    + '&path=' + encodeURIComponent('websockify?token=' + vtok);
+}
+
+const RATE = 48000;
+const WORKLET = `
+class Player extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.q = []; this.off = 0; this.frames = 0; this.playing = false; this.n = 0;
+    this.port.onmessage = e => { this.q.push(e.data); this.frames += e.data.length / 2; };
+  }
+  drop(k) {                       // discard k frames from the head of the queue
+    while (k > 0 && this.q.length) {
+      const avail = (this.q[0].length - this.off) / 2, d = Math.min(k, avail);
+      this.off += 2 * d; this.frames -= d; k -= d;
+      if (this.off >= this.q[0].length) { this.q.shift(); this.off = 0; }
+    }
+  }
+  process(_, outputs) {
+    const L = outputs[0][0], R = outputs[0][1] || outputs[0][0], n = L.length;
+    if (!this.playing && this.frames >= ${RATE} * 0.06) this.playing = true;     // prebuffer 60 ms
+    if (this.frames > ${RATE} * 0.3) this.drop(this.frames - ${RATE} * 0.12);    // cap latency
+    for (let i = 0; i < n; i++) {
+      if (!this.playing || !this.q.length) { L[i] = R[i] = 0; this.playing = false; continue; }
+      const c = this.q[0];
+      L[i] = c[this.off]; R[i] = c[this.off + 1];
+      this.off += 2; this.frames--;
+      if (this.off >= c.length) { this.q.shift(); this.off = 0; }
+    }
+    if (++this.n % 40 === 0) this.port.postMessage(this.frames);
+    return true;
+  }
+}
+registerProcessor('player', Player);`;
+
+let ctx, node, gain, ws, on = false;
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host
+                     + '/websockify?token=' + encodeURIComponent(atok), ['binary']);
+  ws.binaryType = 'arraybuffer';
+  let carry = null;
+  ws.onmessage = e => {
+    let b = new Uint8Array(e.data);
+    if (carry) { const m = new Uint8Array(carry.length + b.length); m.set(carry); m.set(b, carry.length); b = m; carry = null; }
+    const usable = b.length - (b.length % 4);              // whole stereo frames only
+    if (usable < b.length) carry = b.slice(usable);
+    const s = new Int16Array(b.buffer, b.byteOffset, usable / 2), f = new Float32Array(s.length);
+    for (let i = 0; i < s.length; i++) f[i] = s[i] / 32768;
+    node.port.postMessage(f, [f.buffer]);
+  };
+  ws.onclose = () => { if (on) { $('st').textContent = 'sound reconnecting…'; setTimeout(connect, 1000); } };
+}
+$('snd').onclick = async () => {
+  if (!ctx) {
+    ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' })));
+    node = new AudioWorkletNode(ctx, 'player', { outputChannelCount: [2] });
+    gain = new GainNode(ctx, { gain: +$('vol').value });
+    node.connect(gain).connect(ctx.destination);
+    node.port.onmessage = e => { if (on) $('st').textContent = `sound live · ${Math.round(e.data / RATE * 1000)} ms buffer`; };
+  }
+  on = !on;
+  if (on) { await ctx.resume(); connect(); $('snd').textContent = 'Sound off'; $('snd').className = 'on'; }
+  else { ws && ws.close(); await ctx.suspend(); $('snd').textContent = 'Turn sound on'; $('snd').className = ''; $('st').textContent = 'sound off'; }
+  $('vnc').focus();
+};
+$('vol').oninput = () => { if (gain) gain.gain.value = +$('vol').value; };
+</script>
+</body>
+</html>

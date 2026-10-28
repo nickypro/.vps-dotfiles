@@ -19,6 +19,8 @@ internet ──22───> host sshd ──ProxyJump─────────
                                     claude, codex, t3, gh, zsh+p10k
                                     /home/dev  <- /srv/agent-box/home
                                     /data      <- /srv/agent-box/data
+                                    /cells     <- /srv/agent-box/cells
+                                      isolated agents: own users, no sudo
 ```
 
 ## Pick how you reach the web UI
@@ -56,7 +58,7 @@ On a fresh Ubuntu/Debian VPS with Docker and fail2ban installed:
 git clone https://github.com/nickypro/.vps-dotfiles && cd .vps-dotfiles/agent-box
 
 # 1. Storage. The host user that owns it should be uid 1000, like `dev` inside.
-sudo mkdir -p /srv/agent-box/{home,data} && sudo chown -R 1000:1000 /srv/agent-box
+sudo mkdir -p /srv/agent-box/{home,data,cells} && sudo chown 1000:1000 /srv/agent-box/{home,data}
 
 # 2. Who can SSH in.
 cp authorized_keys.example authorized_keys && $EDITOR authorized_keys
@@ -196,6 +198,8 @@ make doctor        # verify the things that have broken before
 make update        # latest claude, codex and t3, in place, then restart T3
 make rebuild       # fresh base image + latest CLIs, recreate the container
 make t3-restart    # restart T3 without dropping SSH sessions
+make secret KEY=OPENAI_API_KEY  # save an API key for the agents (asks, hidden)
+make cell CELL=web              # a new isolated agent (see Isolated agents)
 make pair LABEL=phone           # T3 pairing link for one more device
 make cert NAME_ARG=phone        # mtls: client cert for a new device
 make cert-revoke NAME_ARG=phone # mtls: refuse that cert from now on
@@ -204,6 +208,184 @@ make cert-revoke NAME_ARG=phone # mtls: refuse that cert from now on
 `make update` is quick but lives in the container's own layer, which a
 recreate throws away. `make rebuild` re-downloads the base image (security
 fixes) and the CLIs (at most once a day), so it never rolls you back.
+
+## Isolated agents ("cells")
+
+Every agent in the box runs as `dev`, with sudo, and can read everything in
+it: your logins, `~/.env`, every project. That's usually fine; it's your box.
+For work you trust less (a repo from a stranger, a scraper reading random
+sites, a project for someone else), make a **cell**: a separate Linux user
+with its own folder. It shows up in T3 as two more providers, so you use it
+from the same T3, with no new connection or pairing.
+
+```sh
+make cell CELL=web                           # on the host
+make secret KEY=ANTHROPIC_API_KEY CELL=web   # its own API key (a limited one), or log it in:
+ssh agent-box
+cell web claude auth login                   # a separate account, not yours
+cell web codex login --device-auth
+```
+
+Then in T3, add the project `/cells/web/work` and pick **Cell web** (Claude)
+or **Cell web Codex** for its threads. Your own providers refuse to start
+in that folder, on purpose.
+
+| | your agents (`dev`) | a cell |
+|---|---|---|
+| Files | everything in the box | `/cells/web` (its home, work and `shared/` folders) and world-readable system files |
+| sudo | yes | no |
+| Your logins, `~/.env`, T3's settings | yes | no; it has its own |
+| T3's tools (start threads, hand work to other agents) | yes | no |
+| Network | the internet, not the host or private networks | the same, and nothing listening in the container except its own ports 20000-29999 |
+| Other users' processes | all | only its own |
+
+Give it some of your files:
+
+```sh
+sudo make cell-share CELL=web DIR=/data/papers         # read-only, as /cells/web/shared/papers
+sudo make cell-share CELL=web DIR=/data/out RW=1       # read-write
+sudo make cell-unshare CELL=web DIR=papers
+make cells                                             # cells, logins, shared folders
+cell web import ~/projects/thing                       # inside the box: give it its own copy
+cell web                                               # inside the box: a shell as the cell
+```
+
+A share is a bind mount, so the cell sees that one folder and nothing around
+it. A read-write share of anything holding a git repo is refused: the cell
+could leave settings in it (a git hook, `core.fsmonitor`, a changed
+`package.json` script) that run its code the next time *you* use git or the
+project's scripts there. Share those read-only, or `import` a copy.
+
+**How T3 runs a cell.** The cell's providers have their binary path set to
+`/opt/agent-box/cell-bin/claude-web` (and `codex-web`). That wrapper checks
+the network guard, drops your environment, and runs the real `claude` as
+`cell-web` through sudo. T3 talks to it over stdin/stdout as usual, so chat,
+diffs, checkpoints and interrupts all work.
+
+**The traps it avoids.** Each of these would hand the cell your rights:
+
+- **T3's own tool server.** T3 gives every agent tools (MCP) on its own port,
+  and with them an agent can start threads on your *un*isolated providers.
+  The guard blocks cells from every port in the container, so a cell starts
+  without those tools. If the guard is off, cells refuse to start.
+- **Git.** T3 runs git in project folders constantly. A repo the cell can
+  write can make git run programs. So `/usr/local/bin/git` runs git *as the
+  cell* inside `/cells`, and if that's ever bypassed, git refuses the
+  cell-owned repo ("dubious ownership"). Never add `/cells` to your git
+  `safe.directory`.
+- **Your own agents in its folder.** A project's settings can run commands
+  when an agent starts (Claude's hooks). `make cell` points your T3
+  providers at `/opt/agent-box/bin/claude` and `codex`, which refuse to start
+  inside `/cells`.
+- **You.** In a cell's folder, T3's terminal is still *your* shell. Don't run
+  the cell's scripts there; `cell web` gives you its shell.
+
+Limits: it's the same container, so the same kernel, CPU/RAM cap and
+internet access; a kernel bug gets past it like anything else. Cells can
+reach each other's servers on 20000-29999. T3 can't make worktrees for a
+cell's project (it puts them in your home), so use Local. Claude's built-in
+`/sandbox` and Codex's sandbox don't work inside Docker (they need user
+namespaces, which Docker blocks); cells do that job here.
+
+## Extras: a desktop, a real browser, Synthesizer V, scraping
+
+Pick them in `config.mk`, e.g. `EXTRAS = desktop wine scraping`, then `make
+rebuild`. All three add about 4 GB to the image.
+
+### A desktop in your browser (`desktop`)
+
+Some jobs need a real browser: a site that blocks headless ones, a login, or
+you watching what the agent does. Rather than a VM, the box runs a private
+desktop that you open in your own browser, with sound:
+
+```sh
+desktop start          # inside the box; prints an ssh -L line and a link
+desktop browser        # Chromium on the desktop; agents drive it via 127.0.0.1:9222
+claude mcp add browser -s user -- npx -y @playwright/mcp@latest --cdp-endpoint http://127.0.0.1:9222
+codex mcp add browser -- npx -y @playwright/mcp@latest --cdp-endpoint http://127.0.0.1:9222
+desktop stop           # frees the memory
+```
+
+Without the desktop, agents can still use a headless browser:
+`claude mcp add playwright -s user -- npx -y @playwright/mcp@latest --headless --no-sandbox --executable-path /usr/bin/chromium`.
+
+- Nothing listens on the network except the noVNC page on 127.0.0.1, which
+  only connects someone holding the two random tokens in the link. The
+  display and the sound are Unix sockets in a 0700 folder.
+- Chromium runs without its own sandbox (Docker blocks the user namespaces
+  it needs). The container is the sandbox, so don't log in there to
+  anything you wouldn't let the agents use.
+- A cell gets its own desktop: `cell web desktop start` (ports 20018/20019
+  for the first cell). Yours stays out of its reach.
+- Why not a VM? It needs `/dev/kvm`, which most VPSes don't offer, and
+  privileges that would weaken the container. The desktop covers browsing
+  and GUI apps.
+
+### Synthesizer V Studio 2 and Kasane Teto (`desktop wine`)
+
+Synthesizer V 2 has no Linux version (Studio 1 had one) and no way to
+render without its window, so on a server it runs under Wine on the desktop.
+`extras/synthv` follows the community recipe from
+[mito551/synthv2-linux](https://github.com/mito551/synthv2-linux) and was
+tested with 2.2.1, including the Dreamtonics log-in and the Kasane Teto AI 2
+trial playing through the desktop's sound.
+
+```sh
+/opt/agent-box/extras/synthv/setup   # Wine + WebView2 + the app, in ~/.local/share/synthv (~2.5 GB)
+synthv                               # start it on the desktop
+```
+
+- **Log in once.** Log In opens the browser on the desktop; allow it to
+  open the link with the app. If the dialog then spins forever, press
+  Escape: under Wine it doesn't close itself. Later starts are logged in.
+- **One device at a time.** Dreamtonics licences move to whichever machine
+  logged in last, so this takes it off your own computer until you log in
+  there again.
+- **Voices.** Cloud icon, then Trial Products or My Products. Kasane Teto AI
+  2 is sold by AH-Software (Japan) and the Dreamtonics store; the 7-day
+  trial plays but can't export audio.
+- **What agents can do:** write the song as MIDI or `.svp` (a JSON project
+  file), import it, and click through the app on the desktop with
+  `xdotool`. SynthV's own scripts (Lua or JavaScript, from its Scripts menu)
+  can edit notes but not render; exporting a WAV is a click on Render.
+
+### Scraping tools (`scraping`)
+
+In `/opt/scrape` (use `/opt/scrape/bin/python`), with the command-line ones
+on PATH:
+
+| Tool | For |
+|---|---|
+| curl_cffi | HTTP that looks like a real browser to anti-bot checks (`impersonate="chrome"`) |
+| trafilatura | the main text of a page, without menus and ads (`trafilatura -u URL`) |
+| yt-dlp + ffmpeg | video, audio and subtitles from most sites |
+| Camoufox | Firefox built to avoid bot detection; run `camoufox fetch` once (per user) |
+| Playwright | browser automation from Python (`connect_over_cdp` reaches the desktop browser) |
+| markitdown | PDFs, Word and slides to Markdown |
+| BeautifulSoup, lxml, httpx | parsing and plain HTTP |
+
+Many sites block data-centre IPs whatever the browser. If you need a home
+connection, an SSH SOCKS proxy through a machine at home
+(`ssh -N -D 127.0.0.1:1080 home`, then `--proxy socks5://127.0.0.1:1080`)
+works with most of these.
+
+### camofox-browser
+
+[camofox-browser](https://github.com/jo-inc/camofox-browser) is a Camoufox
+server built for agents (pages as accessibility snapshots with stable
+element references), with an MCP adapter. It listens on every interface and
+reports crashes to its authors unless told otherwise; the settings below stop
+both and require a key. The server runs in its own tmux session:
+
+```sh
+echo "CAMOFOX_ACCESS_KEY=$(openssl rand -hex 16)" >> ~/.env
+tmux new -d -s camofox 'set -a; . ~/.env; CAMOFOX_BIND_HOST=127.0.0.1 CAMOFOX_CRASH_REPORT_ENABLED=false npx -y @askjo/camofox-browser'
+. ~/.env && claude mcp add camofox -s user -e CAMOFOX_BASE_URL=http://127.0.0.1:9377 \
+  -e CAMOFOX_ACCESS_KEY="$CAMOFOX_ACCESS_KEY" -- npx -y @askjo/camofox-browser-mcp
+```
+
+The first start downloads Camoufox (~300 MB). With `desktop` in EXTRAS it
+uses a virtual display (Xvfb); otherwise it runs headless.
 
 ## Backups (Kopia to Backblaze B2)
 
@@ -365,13 +547,20 @@ from using the box as a step towards anything else:
   rewrite or flush it. Needs `nft` (package `nftables`, installed by
   default on current Debian/Ubuntu). `agent-box-guard.service` applies it at boot.
 - The rules match the docker bridge name, which changes when compose recreates
-  the network. `make up` re-applies the guard and `make doctor` warns if it's
-  aimed at an old bridge.
+  the network. The service watches for the container starting and re-applies
+  everything each time; `make doctor` warns if it's aimed at an old bridge.
+- **Cells get a second table**, inside the container's own network
+  namespace: they can't connect to anything in the container (T3, sshd, your
+  dev servers, a browser's debugging port) except ports 20000-29999, nor to
+  any private address. The host applies it with `nsenter`; the container has
+  no `CAP_NET_ADMIN`, so not even root in there can lift it. The same step
+  hides other users' processes from cells (`/proc` with `hidepid`, group
+  `dev` exempt), so they can't read your commands' arguments.
 
 ```sh
 sudo make guard-link   # install + start (once)
 make net-test          # from inside the container: what's open, what's blocked
-sudo make guard-off    # lift it until the next boot or `make up`
+sudo make guard-off    # lift it until the next boot or `make up` (cells then refuse to start)
 ```
 
 If `make net-test` says DNS is BROKEN, your provider's DNS server is in one
@@ -385,7 +574,17 @@ agent can't exhaust the host's process table.
 ## Secrets
 
 Don't put API keys in `~/.zshrc`; it ends up in backups and screenshares. Put
-them in `~/.env` (mode 0600, `KEY=value` lines). The seeded `.zshrc` loads it.
+them in `~/.env` (mode 0600, `KEY=value` lines):
+
+```sh
+make secret KEY=OPENAI_API_KEY             # your agents: ~/.env (then make t3-restart)
+make secret KEY=OPENAI_API_KEY CELL=web    # one cell's own ~/.env only
+```
+
+It asks for the value without showing it, so it never lands in your shell
+history or a process list. Your `.zshrc` loads `~/.env`, and so does T3's
+start script, so agents T3 starts see the keys too. Cells never see yours:
+each reads only its own `/cells/<name>/home/.env`.
 
 Everything in the box, `~/.env` and the agents' own logins included, is
 readable by every agent, and an agent can be talked into things by a web page
@@ -395,7 +594,8 @@ it reads. So hand them credentials you'd be fine losing:
   for just the repos the agents work on (`gh auth login --with-token`),
   rather than the all-repos login `gh auth login` gives you by default.
 - **API keys:** a separate key for the box, with a spending limit set in the
-  provider's dashboard.
+  provider's dashboard. For a cell, another separate key, so you can cancel
+  just that one.
 - **Nothing else:** no cloud admin keys, no SSH keys to other machines.
 
 ## Things that bit us (don't undo these)
@@ -409,9 +609,17 @@ it reads. So hand them credentials you'd be fine losing:
 - **oh-my-zsh lives in `/opt`, not `/home/dev`.** The home dir is a bind
   mount, so anything the image writes there is hidden at runtime. Only the
   `.zshrc` is seeded into the volume, once, and never overwritten.
-- **`npm install` needs `--allow-scripts=msgpackr-extract,node-pty`.** npm 11
-  blocks install scripts by default; without it node-pty silently fails to
-  build and T3's terminals don't work. The Dockerfile checks the build.
+- **`npm install` needs `--allow-scripts`.** npm 11 skips install scripts
+  unless told, and Claude Code's sets up its native binary. (T3 0.1 and later
+  no longer builds node-pty through npm: the `t3` package is a launcher that
+  downloads a self-contained binary into `~/.t3/runtime` on first start. An
+  older Dockerfile that checked T3's node-pty folder fails to build.)
+- **Read-only bind mounts can arrive writable in the container.** The copy
+  that propagates in is taken before mount's read-only step. `cell-share`
+  and the guard set read-only from the container's side as well.
+- **Use `docker exec -u root`, not plain `docker exec`, to see dev's
+  processes.** With cells hiding processes, only group `dev` sees everyone,
+  and plain `docker exec` drops root's extra groups.
 - **T3 must listen on `0.0.0.0` inside the container.** If it's on
   `127.0.0.1`, Docker's port publish can't reach it and the web UI returns
   502s (from nginx or `tailscale serve`). This happens if T3's desktop SSH

@@ -1,0 +1,48 @@
+#!/bin/bash
+# How T3 starts an isolated agent. T3 runs this as dev: it is the "binary
+# path" of a cell's providers, through symlinks named <tool>-<cell>, e.g.
+#   /opt/agent-box/cell-bin/claude-web -> /opt/agent-box/cells/cell-run
+# It runs the real claude or codex as the cell's user, with a clean
+# environment (none of your API keys or tokens), after checking that the
+# network guard is up. T3 talks to it over stdin/stdout exactly as before.
+set -euo pipefail
+. /opt/agent-box/cells/lib.sh
+self=${0##*/}
+tool=${self%%-*}
+name=${self#*-}
+case $tool in
+  claude|codex) ;;
+  *) echo "cell-run: start me as claude-<cell> or codex-<cell>, not $self" >&2; exit 64 ;;
+esac
+cell_exists "$name" || { echo "cell-run: there is no cell called '$name'" >&2; exit 64; }
+user=cell-$name
+
+# T3 checks the version from wherever it likes; that's harmless. Anything
+# else first proves the guard is on: without it the agent could talk to T3's
+# own API on this machine, and through it start agents that aren't isolated.
+case ${1-} in
+  --version|-v|-V) ;;
+  *)
+    if sudo -n -u "$user" timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2222' 2>/dev/null; then
+      echo "cell-run: the network guard isn't on for isolated agents, so '$name' won't start." >&2
+      echo "  On the host: sudo systemctl restart agent-box-guard   (first time: sudo make guard-link)" >&2
+      exit 69
+    fi
+    ;;
+esac
+
+# Pass on only harmless settings from T3 and the Claude SDK. Credentials
+# stay behind: the cell has its own login and its own ~/.env.
+keep=()
+while IFS= read -r v; do
+  case $v in
+    *TOKEN*|*KEY*|*SECRET*|*PASSWORD*|*AUTH*|CLAUDE_CONFIG_DIR|CODEX_HOME) ;;
+    CLAUDE_CODE_*|CLAUDE_AGENT_*|ANTHROPIC_MODEL|ANTHROPIC_DEFAULT_*|ANTHROPIC_SMALL_FAST_MODEL|\
+    MAX_THINKING_TOKENS|MCP_TIMEOUT|MCP_TOOL_TIMEOUT|DISABLE_*|CODEX_*|RUST_LOG|\
+    TERM|COLORTERM|NO_COLOR|FORCE_COLOR|LANG|LC_*|TZ)
+      keep+=("$v") ;;
+  esac
+done < <(compgen -e)
+pe=()
+if [ ${#keep[@]} -gt 0 ]; then pe=(--preserve-env="$(IFS=,; echo "${keep[*]}")"); fi
+exec sudo -n -u "$user" "${pe[@]}" -- /opt/agent-box/cells/cell-exec "$tool" "$@"
