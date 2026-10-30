@@ -2,7 +2,7 @@
 
 A Docker container running **Claude Code, Codex and T3 Code** on a VPS. You
 reach it over SSH, and T3's web UI over Tailscale (or, if you prefer, behind
-nginx on a public domain).
+nginx on a public domain). Or skip the web UI and use the T3 app over SSH.
 
 The idea: agents get a full dev box with sudo, but **inside a container** with
 capped RAM/CPU, no Docker socket, and no new ports open to the internet.
@@ -23,7 +23,7 @@ internet ──22───> host sshd ──ProxyJump─────────
                                       isolated agents: own users, no sudo
 ```
 
-## Pick how you reach the web UI
+## Pick how you reach T3
 
 T3's web UI is effectively a terminal with sudo in the container, so who can
 reach it matters. One setting, `ACCESS` in `config.mk`:
@@ -33,13 +33,21 @@ reach it matters. One setting, `ACCESS` in `config.mk`:
   machines). No domain, no certs, no nginx, nothing open to the internet.
   `tailscale serve` gives the box an HTTPS address like
   `https://myvps.your-tailnet.ts.net` that only your tailnet can see.
+- **`ssh`** (experimental, but the author's favourite). No web UI at all. The
+  T3 app connects over the same SSH as `ssh agent-box`, finds the T3 server
+  running in the box and pairs itself. No domain, certs, nginx or Tailscale,
+  and nothing to reach but SSH: your SSH key is the lock. The catch is
+  that every device needs the app: the desktop app does this out of the box,
+  Android needs an unofficial build, and there's nothing for iPhone yet (see
+  [The T3 desktop and phone apps](#the-t3-desktop-and-phone-apps)).
 - **`mtls`**. A public domain via nginx + Let's Encrypt. The browser must
   present a client certificate from your own private CA ("mutual TLS"); an
   optional password covers devices without one.
 - **`public`**. A public domain via nginx, password only, with per-IP rate
   limiting and fail2ban banning IPs that guess wrong.
 
-In every mode, T3's own pairing token (`make pair`) still applies on top.
+In every mode, T3's own pairing still applies on top: `make pair` for a
+browser, while the app pairs itself over SSH.
 
 > **About `public`:** in this mode a single password is all that keeps the
 > internet out of a terminal with sudo in your container (and the agents'
@@ -67,7 +75,7 @@ cp authorized_keys.example authorized_keys && $EDITOR authorized_keys
 make rebuild && sudo make guard-link && make net-test && make doctor
 ```
 
-Then the web UI, depending on `ACCESS`.
+Then the way in, depending on `ACCESS`.
 
 **tailscale** (also needs `jq`, which the Makefile uses to look up the box's
 tailnet name):
@@ -91,6 +99,16 @@ make pair                  # T3 pairing link
   tailnet (a team, or a device someone shared with you), add a rule to the
   tailnet's access policy (admin console, Access controls) so only you can
   reach this machine.
+
+**ssh** (experimental). Set `ACCESS = ssh` in `config.mk`, then:
+
+```sh
+sudo make host-config      # nothing to install: removes any nginx site or tailscale serve
+```
+
+Then add `agent-box` in the T3 app, as in
+[The T3 desktop and phone apps](#the-t3-desktop-and-phone-apps). There's no
+`make pair` in this mode; the app does it.
 
 **mtls** (needs nginx and certbot). Set `ACCESS = mtls` and `DOMAIN` in
 `config.mk`, and your domain in `nginx/agent-box-mtls.conf`, then:
@@ -164,10 +182,40 @@ and deleting a line really does revoke that key.
 
 ### The T3 desktop and phone apps
 
-The desktop app can connect over SSH: add `agent-box` as an SSH host and it
-picks up the T3 server already running in tmux, so the web UI, the desktop
-app and your phone all see the same threads. On a phone, open the pairing
-link from `make pair LABEL=phone` (over your tailnet, in tailscale mode).
+The desktop app can connect over SSH: add `agent-box` as an SSH host. It runs
+your own `ssh` with your `~/.ssh/config`, so the `ProxyJump` above just works.
+It picks up the T3 server already running in tmux and pairs itself, so the
+web UI, the desktop app and your phone all see the same threads. This works
+in every mode; with `ACCESS = ssh` it's the way in.
+
+On a phone, open the pairing link from `make pair LABEL=phone` (over your
+tailnet, in tailscale mode). With `ACCESS = ssh` there's no link to open:
+
+- **Android:** an unofficial build of the T3 app that speaks SSH itself, by
+  this box's author:
+  [android-ssh-2026-10-30](https://github.com/nickypro/t3code/releases/tag/android-ssh-2026-10-30),
+  proposed upstream in
+  [pingdotgg/t3code#27806](https://github.com/pingdotgg/t3code/discussions/27806).
+  It's experimental and sideloaded, not from T3's makers. In the app,
+  Settings → SSH → Create SSH key, then add its public key to `./authorized_keys`
+  for the box, and to your user's `~/.ssh/authorized_keys` on the host, limited
+  to the jump:
+
+  ```
+  restrict,port-forwarding,permitopen="127.0.0.1:2222",command="/bin/false" ssh-ed25519 AAAA... t3code-android
+  ```
+
+  Paste the `myvps` and `agent-box` blocks above into the app's SSH config,
+  then Add environment → Or connect over SSH → `agent-box`. Check the two
+  host keys it asks about with `ssh-keygen -lf` on the host:
+  `/etc/ssh/ssh_host_ed25519_key.pub` (the host's) and
+  `ssh_host_keys/ssh_host_ed25519_key.pub` next to the Makefile (the box's).
+- **iPhone:** no SSH-capable app yet; use one of the web modes.
+
+If the tmux server has died when an app connects, the app starts a server of
+its own. Threads are the same, but that server doesn't load `~/.env` or the
+isolated agents' guards. `make doctor` warns about it; `make t3-restart` puts
+the box's own server back.
 
 ### Closing public SSH (tailscale mode, optional)
 
@@ -672,8 +720,10 @@ it reads. So hand them credentials you'd be fine losing:
 - **T3 must listen on `0.0.0.0` inside the container.** If it's on
   `127.0.0.1`, Docker's port publish can't reach it and the web UI returns
   502s (from nginx or `tailscale serve`). This happens if T3's desktop SSH
-  launcher starts its own server because the tmux one died. `make doctor`
-  checks for it; fix with `make t3-restart`.
+  launcher starts its own server because the tmux one died. That server also
+  lacks `~/.env` and the isolated agents' guards, so fix it in `ACCESS = ssh`
+  too, where nothing 502s. `make doctor` checks for it; fix with
+  `make t3-restart`.
 - **`make t3-restart` also kills stray `t3 serve` processes.** Killing the
   tmux session alone can leave the old server orphaned and holding the port.
 - **sshd is PID 1, and T3 runs in tmux.** Restarting T3 never drops SSH.

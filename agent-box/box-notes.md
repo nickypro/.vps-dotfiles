@@ -2,8 +2,8 @@
 
 You are in an **agent box**: a Docker container on a server, set up for
 coding agents. You run as `dev` (uid 1000) with sudo and no password. The
-owner reaches the box over SSH and through T3 Code's web UI. How it's built:
-github.com/nickypro/.vps-dotfiles, folder `agent-box`.
+owner reaches the box over SSH and through T3 Code (its web UI or app). How
+it's built: github.com/nickypro/.vps-dotfiles, folder `agent-box`.
 
 ## What survives a rebuild
 

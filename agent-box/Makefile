@@ -2,7 +2,7 @@
 # the fail2ban jails and the backup units all live in this directory and are
 # symlinked into place, so `git diff` shows the full state of the deployment.
 #
-# Settings (how the web UI is reached, your domain) are in config.mk.
+# Settings (how T3 is reached, your domain) are in config.mk.
 #
 # Uses .RECIPEPREFIX so recipes are indented with ">" instead of tabs.
 .RECIPEPREFIX = >
@@ -11,8 +11,8 @@ SHELL := /bin/bash
 
 -include config.mk
 ACCESS ?= tailscale
-ifeq ($(filter $(ACCESS),tailscale mtls public),)
-  $(error ACCESS must be one of: tailscale mtls public - see config.mk)
+ifeq ($(filter $(ACCESS),tailscale ssh mtls public),)
+  $(error ACCESS must be one of: tailscale ssh mtls public - see config.mk)
 endif
 
 COMPOSE := docker compose
@@ -30,12 +30,12 @@ DOMAIN ?= code.example.com
 .PHONY: help build up down restart rebuild update logs shell t3-logs t3-restart pair secret \
         claude-account claude-accounts claude-account-rm \
         cell cells cell-share cell-unshare cell-rm \
-        host-config host-config-tailscale host-config-mtls host-config-public fail2ban-config \
+        host-config host-config-tailscale host-config-ssh host-config-mtls host-config-public fail2ban-config \
         ca cert cert-revoke client-cert-list web-passwd \
         backup-link backup-status backup-now \
         guard-link guard-off net-test \
-        status status-tailscale status-mtls status-public ps \
-        doctor doctor-tailscale doctor-mtls doctor-public
+        status status-tailscale status-ssh status-mtls status-public ps \
+        doctor doctor-tailscale doctor-ssh doctor-mtls doctor-public
 
 help:  ## Show this help
 > @grep -hE '^[a-z0-9-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[1m%-16s\033[0m %s\n", $$1, $$2}'
@@ -90,6 +90,7 @@ t3-restart:  ## Restart just T3, without dropping SSH sessions
 > @sleep 3 && curl -sf -o /dev/null -w "  t3 http: %{http_code}\n" http://127.0.0.1:3773/ || echo "  t3 not responding yet"
 
 pair:  ## Mint a T3 pairing token for the web UI (30 min):  make pair LABEL=phone
+> @test "$(ACCESS)" != ssh || { echo "  no web UI in ssh mode: the T3 app pairs itself when you add agent-box as an SSH host"; exit 1; }
 > @test -n "$(DOMAIN)" || { echo "  no DOMAIN: is tailscale up and jq installed? Or set DOMAIN in config.mk"; exit 1; }
 > @docker exec $(NAME) su dev -s /bin/sh -c 't3 auth pairing create --ttl 30m --label $(or $(LABEL),laptop) --base-url https://$(DOMAIN)' | grep -aE 'Token:|Pair URL:|Expires' || true
 
@@ -157,6 +158,13 @@ host-config-tailscale:
 > $(UNLINK_NGINX)
 > @if systemctl is-active -q nginx; then nginx -t && systemctl reload nginx; fi
 > @echo "  web UI: https://$(DOMAIN)  (your tailnet only)"
+
+host-config-ssh:
+> @# No web UI: take down whatever another mode left serving T3.
+> $(UNLINK_NGINX)
+> @if systemctl is-active -q nginx; then nginx -t && systemctl reload nginx; fi
+> @command -v tailscale >/dev/null && tailscale serve --https=443 http://127.0.0.1:3773 off >/dev/null 2>&1; true
+> @echo "  no web UI: in the T3 app, add agent-box (your ~/.ssh/config) as an SSH host"
 
 host-config-mtls host-config-public: host-config-%:
 > @test "$(DOMAIN)" != code.example.com || { echo "  set DOMAIN in config.mk first"; exit 1; }
@@ -227,6 +235,7 @@ client-cert-list:  ## mtls: list issued client certs and which are revoked
 
 web-passwd:  ## mtls/public: set the web password:  make web-passwd USER_ARG=me
 > @test "$(ACCESS)" != tailscale || { echo "  no web password in tailscale mode: your tailnet is the lock"; exit 1; }
+> @test "$(ACCESS)" != ssh || { echo "  no web password in ssh mode: there is no web UI"; exit 1; }
 > @test -n "$(USER_ARG)" || { echo "usage: make web-passwd USER_ARG=<user>"; exit 1; }
 > @# Generated, never chosen. nginx rereads the file on every request.
 > @mkdir -p $(AUTHDIR) && P=$$(openssl rand -base64 15 | tr -d '/+=' | head -c 18) && \
@@ -282,6 +291,9 @@ status: ps  ## Show container, web access and fail2ban status
 status-tailscale:
 > @tailscale serve status 2>&1 | sed 's/^/  /'
 
+status-ssh:
+> @echo "  no web UI: T3 apps connect over SSH (agent-box)"
+
 status-mtls status-public:
 > @curl -sk -o /dev/null -w "  nginx:      %{http_code} (401 expected without credentials)\n" https://$(DOMAIN)/ || true
 > @fail2ban-client status nginx-http-auth 2>/dev/null | grep -E "Currently banned|Total banned" | sed 's/^/  nginx-http-auth /' || true
@@ -298,7 +310,7 @@ doctor:  ## Verify the things that have broken before
 > @echo "checking mounts..."
 > @docker exec $(NAME) sh -c 'for d in /home/dev /data; do printf "  %-10s %s\n" $$d "$$(mountpoint -q $$d && echo mounted || echo NOT-MOUNTED)"; done'
 > @echo "checking T3 is reachable through the port publish (not bound to 127.0.0.1)..."
-> @docker exec -u dev $(NAME) ps -eo args | grep -q -- "t3 serve.*--host 0.0.0.0" && echo "  t3 bound to 0.0.0.0 OK" || echo "  WARNING: t3 not on 0.0.0.0 - the web UI will 502"
+> @docker exec -u dev $(NAME) ps -eo args | grep -q -- "t3 serve.*--host 0.0.0.0" && echo "  t3 bound to 0.0.0.0 OK" || echo "  WARNING: t3 not on 0.0.0.0 (did its tmux die?) - the web UI will 502, and a server the T3 app started has no ~/.env or cell guards: make t3-restart"
 > @echo "checking host key persistence..."
 > @ls $(CURDIR)/ssh_host_keys/ssh_host_ed25519_key >/dev/null 2>&1 && echo "  host keys persisted OK" || echo "  WARNING: host keys not persisted"
 > @echo "checking network guard..."
@@ -316,6 +328,13 @@ doctor-tailscale:
    echo "$$S" | grep -qi 'funnel on' && echo "  WARNING: Funnel is on, so T3 is open to the whole internet - sudo tailscale serve reset && sudo make host-config"; \
    true
 > @ls /etc/nginx/sites-enabled/agent-box*.conf >/dev/null 2>&1 && echo "  WARNING: an agent-box nginx site is still enabled - sudo make host-config" || echo "  no agent-box nginx site OK"
+
+doctor-ssh:
+> @ls /etc/nginx/sites-enabled/agent-box*.conf >/dev/null 2>&1 && echo "  WARNING: an agent-box nginx site is still enabled - sudo make host-config" || echo "  no agent-box nginx site OK"
+> @command -v tailscale >/dev/null && tailscale serve status 2>&1 | grep -q '127.0.0.1:3773' \
+   && echo "  WARNING: tailscale is still serving T3 - sudo make host-config" || echo "  no tailscale serve for T3 OK"
+> @docker exec $(NAME) /usr/sbin/sshd -T -f /etc/ssh/sshd_config_box 2>/dev/null | grep -qx 'allowtcpforwarding yes' \
+   && echo "  box sshd allows port forwarding (the T3 app needs it) OK" || echo "  WARNING: the box's sshd refuses port forwarding (or this needs root): the T3 app can't connect"
 
 doctor-mtls doctor-public: doctor-%:
 > @test -e /etc/nginx/sites-enabled/agent-box-$*.conf && echo "  nginx site agent-box-$*.conf linked OK" || echo "  WARNING: nginx site not linked - sudo make host-config"
